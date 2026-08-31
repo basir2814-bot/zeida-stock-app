@@ -8,6 +8,202 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", layout="wide")
 
+st.markdown(r'''
+<style>
+/* ===== 賊大戰術 Pro：深色統一主題 v2 ===== */
+:root{
+  --z-bg:#050b14;
+  --z-bg2:#07131f;
+  --z-panel:#0b1826;
+  --z-panel2:#0e2032;
+  --z-line:#1d4262;
+  --z-line2:#2a5f87;
+  --z-text:#edf6ff;
+  --z-muted:#98aec3;
+  --z-blue:#38a8ff;
+  --z-cyan:#4fdcff;
+  --z-green:#38d987;
+  --z-yellow:#ffc14f;
+  --z-orange:#ff9f35;
+  --z-red:#ff6469;
+  --z-purple:#b881ff;
+}
+
+html,body,[data-testid="stAppViewContainer"],.stApp{
+  background:
+    radial-gradient(circle at 12% 0%,rgba(24,90,148,.22),transparent 28%),
+    radial-gradient(circle at 88% 0%,rgba(53,41,120,.13),transparent 24%),
+    linear-gradient(180deg,#040a12 0%,#06111c 45%,#071522 100%)!important;
+  color:var(--z-text)!important;
+}
+
+[data-testid="stHeader"]{
+  background:rgba(4,10,18,.88)!important;
+  backdrop-filter:blur(8px);
+}
+[data-testid="stToolbar"]{
+  background:transparent!important;
+}
+[data-testid="stDecoration"]{display:none!important;}
+
+.block-container{
+  max-width:1500px!important;
+  padding-top:1rem!important;
+}
+
+/* 一般文字 */
+h1,h2,h3,h4,h5,h6,p,span,label,div{
+  color:inherit;
+}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li{
+  color:#d8e5f1;
+}
+
+/* Streamlit 原生卡片/區塊 */
+[data-testid="stVerticalBlockBorderWrapper"]{
+  background:rgba(8,22,35,.76)!important;
+  border-color:#1f4565!important;
+  border-radius:12px!important;
+}
+
+/* Selectbox / NumberInput / TextInput */
+div[data-baseweb="select"] > div,
+div[data-baseweb="input"] > div,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input{
+  background:#091827!important;
+  color:#eef7ff!important;
+  border-color:#28516f!important;
+}
+div[data-baseweb="select"] svg{fill:#9dc8e9!important;}
+div[data-baseweb="popover"]{
+  background:#0a1928!important;
+}
+div[role="listbox"]{
+  background:#0a1928!important;
+  border:1px solid #2a5578!important;
+}
+div[role="option"]{
+  background:#0a1928!important;
+  color:#eaf5ff!important;
+}
+div[role="option"]:hover{
+  background:#12304b!important;
+}
+
+/* 按鈕 */
+.stButton > button{
+  background:linear-gradient(180deg,#1c9fff,#0b72d4)!important;
+  color:#fff!important;
+  border:1px solid #53baff!important;
+  box-shadow:0 0 16px rgba(32,150,255,.16)!important;
+}
+.stButton > button:hover{
+  background:linear-gradient(180deg,#35adff,#1280e8)!important;
+  border-color:#86ceff!important;
+}
+
+/* Checkbox / Toggle */
+[data-testid="stCheckbox"] label,
+[data-testid="stToggle"] label{
+  color:#dce9f4!important;
+}
+
+/* Dataframe：把原本白色表格改成深色 */
+[data-testid="stDataFrame"],
+[data-testid="stDataFrameResizable"]{
+  background:#081522!important;
+  border:1px solid #214866!important;
+  border-radius:10px!important;
+  overflow:hidden!important;
+}
+[data-testid="stDataFrame"] iframe{
+  background:#081522!important;
+}
+
+/* Streamlit dataframe 目前使用 Glide Data Grid，直接覆蓋 CSS variables */
+[data-testid="stDataFrame"]{
+  --gdg-bg-cell:#091827!important;
+  --gdg-bg-cell-medium:#0d2032!important;
+  --gdg-bg-header:#10283d!important;
+  --gdg-bg-header-hovered:#163650!important;
+  --gdg-bg-header-has-focus:#173b59!important;
+  --gdg-text-dark:#eef7ff!important;
+  --gdg-text-medium:#c8d7e5!important;
+  --gdg-text-light:#91a7ba!important;
+  --gdg-accent-color:#38a8ff!important;
+  --gdg-accent-light:rgba(56,168,255,.18)!important;
+  --gdg-border-color:#244965!important;
+}
+
+/* Alert / info */
+[data-testid="stAlert"]{
+  background:#0c2133!important;
+  border:1px solid #27577b!important;
+  color:#dcecff!important;
+}
+[data-testid="stAlert"] p{color:#dcecff!important;}
+
+/* Expander */
+[data-testid="stExpander"]{
+  background:#091827!important;
+  border:1px solid #214663!important;
+  border-radius:10px!important;
+}
+[data-testid="stExpander"] summary{
+  color:#eaf5ff!important;
+}
+
+/* Tabs */
+[data-baseweb="tab-list"]{
+  background:#081522!important;
+  border:1px solid #1e4362!important;
+  border-radius:9px!important;
+  padding:4px!important;
+}
+[data-baseweb="tab"]{
+  color:#afc4d7!important;
+  background:transparent!important;
+}
+[aria-selected="true"][data-baseweb="tab"]{
+  color:#64bcff!important;
+  background:#0d2c47!important;
+  border-radius:7px!important;
+}
+
+/* Plotly 圖表外框 */
+[data-testid="stPlotlyChart"]{
+  background:#081522!important;
+  border:1px solid #214761!important;
+  border-radius:10px!important;
+  padding:4px!important;
+}
+
+/* Metric */
+[data-testid="stMetric"]{
+  background:linear-gradient(180deg,#0c1c2c,#081522)!important;
+  border:1px solid #214965!important;
+  border-radius:10px!important;
+  padding:12px!important;
+}
+[data-testid="stMetricLabel"]{color:#9fb5c8!important;}
+[data-testid="stMetricValue"]{color:#f4f9ff!important;}
+
+/* 手機版 */
+@media(max-width:900px){
+  .block-container{padding-left:.55rem!important;padding-right:.55rem!important;}
+  [data-testid="stDataFrame"]{font-size:12px!important;}
+  .summary-card{background:linear-gradient(180deg,#0c1b2a,#071521)!important;}
+  .hero{background:linear-gradient(180deg,#0b1b2b,#07131f)!important;}
+  .panel,.section,.filterbox,.detail-card,.legend{
+    background:#081624!important;
+  }
+}
+</style>
+''', unsafe_allow_html=True)
+
+
 TWSE = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 YAHOO_HOSTS = [
@@ -88,12 +284,12 @@ html, body, [class*="css"] {font-family: -apple-system,BlinkMacSystemFont,"Segoe
 .summary-card .label{font-size:14px;color:#d5e0eb;margin-bottom:8px;}
 .summary-card .big{font-size:28px;font-weight:900;letter-spacing:.4px;}
 .summary-card .small{font-size:12px;color:#9eb1c4;margin-top:6px;line-height:1.5;}
-.summary-card.green .big{color:var(--green);}
-.summary-card.orange .big{color:var(--orange);}
-.summary-card.purple .big{color:var(--purple);}
+.summary-card.green{border-color:#1f694d;background:linear-gradient(180deg,#0c2a24,#081b1b);}.summary-card.green .big{color:var(--green);}
+.summary-card.orange{border-color:#6d4b22;background:linear-gradient(180deg,#2b2112,#17170f);}.summary-card.orange .big{color:var(--orange);}
+.summary-card.purple{border-color:#594077;background:linear-gradient(180deg,#211b31,#151225);}.summary-card.purple .big{color:var(--purple);}
 .summary-card.red{border-color:#ad3f48;box-shadow:0 0 0 1px rgba(255,94,99,.12);}
 .summary-card.red .big{color:var(--red);}
-.summary-card.blue .big{color:#49a8ff;}
+.summary-card.blue{border-color:#28577b;background:linear-gradient(180deg,#0b2237,#081724);}.summary-card.blue .big{color:#49a8ff;}
 
 .filterbox{
   border:1px solid var(--line);border-radius:12px;background:#091725;padding:14px 14px 4px;margin:12px 0;
@@ -986,3 +1182,201 @@ if "snap" in st.session_state:
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<div class="note">＊本系統僅提供盤後研究參考，投資請自行評估風險，盈虧自負。</div>', unsafe_allow_html=True)
+
+
+st.markdown(r'''
+<style>
+/* ===== Reference-matched dashboard skin ===== */
+:root{
+  --bg:#06101a;
+  --panel:#0a1622;
+  --panel2:#0c1b29;
+  --border:#1b3953;
+  --border-hi:#235b87;
+  --text:#eef5fb;
+  --muted:#9cb0c2;
+  --blue:#35a7ff;
+  --green:#4bd37b;
+  --orange:#ffad2f;
+  --red:#ff5a5f;
+  --yellow:#ffc94d;
+}
+
+.stApp{
+  background:#06101a!important;
+  color:var(--text)!important;
+}
+.block-container{
+  max-width:1420px!important;
+  padding:14px 14px 28px!important;
+}
+
+/* header */
+.hero{
+  min-height:72px;
+  padding:10px 8px 12px!important;
+  border:none!important;
+  border-radius:0!important;
+  background:transparent!important;
+  box-shadow:none!important;
+  margin-bottom:4px!important;
+}
+.hero-left{gap:10px!important}
+.hero-icon{font-size:34px!important}
+.hero-title{font-size:28px!important;font-weight:900!important;line-height:1!important}
+.hero-sub{font-size:13px!important;color:#b8c6d5!important;margin-top:7px!important}
+.hero-meta{font-size:12px!important;color:#aebdcc!important}
+.hero-title .pro{color:#ffad2f!important}
+
+/* top nav: flatter and more like the reference */
+.navbar{
+  margin:2px 0 10px!important;
+  border:1px solid #1a3550!important;
+  border-radius:7px!important;
+  background:#091522!important;
+}
+.navitem{
+  padding:10px 8px!important;
+  font-size:13px!important;
+  background:#0a1724!important;
+  border-right:1px solid #18314a!important;
+}
+.navitem.active{
+  color:#57b7ff!important;
+  background:#0c2740!important;
+  box-shadow:inset 0 0 0 1px #2c8bd0!important;
+}
+
+/* section shells */
+.section,.panel,.filterbox{
+  background:#091521!important;
+  border:1px solid #1b3852!important;
+  border-radius:8px!important;
+  box-shadow:none!important;
+}
+.section{padding:10px!important;margin:9px 0!important}
+.panel{padding:0!important;margin:9px 0!important;overflow:hidden}
+.filterbox{padding:10px 10px 4px!important;margin:9px 0!important}
+.section-title,.panel-title{
+  font-size:16px!important;
+  font-weight:800!important;
+  color:#48adff!important;
+}
+.panel-title{
+  margin:0!important;
+  padding:9px 12px!important;
+  border-bottom:1px solid #1b3852!important;
+  background:#0a1724!important;
+}
+
+/* summary row exactly 5 columns on desktop */
+.summary-grid{
+  grid-template-columns:repeat(5,1fr)!important;
+  gap:8px!important;
+}
+.summary-card{
+  min-height:114px!important;
+  padding:12px 10px!important;
+  text-align:center!important;
+  align-items:center!important;
+  border-radius:6px!important;
+  background:#0b1825!important;
+  border:1px solid #21425e!important;
+}
+.summary-card .label{font-size:13px!important;color:#d4dee7!important}
+.summary-card .big{font-size:30px!important;line-height:1.05!important}
+.summary-card .small{font-size:11px!important;color:#a4b5c6!important}
+.summary-card.red{border-color:#bd4046!important}
+.summary-card.green .big{color:#54db82!important}
+.summary-card.orange .big{color:#ffad2f!important}
+.summary-card.purple .big{color:#ffb22f!important}
+.summary-card.red .big{color:#ff6166!important}
+.summary-card.blue .big{color:#ffffff!important}
+
+/* filter inputs */
+[data-testid="stSelectbox"] label{font-size:11px!important;color:#b8c6d4!important}
+div[data-baseweb="select"]>div{
+  min-height:38px!important;
+  background:#081522!important;
+  border:1px solid #294760!important;
+  border-radius:5px!important;
+  color:#edf5fb!important;
+}
+.stButton>button{
+  min-height:38px!important;
+  border-radius:5px!important;
+  background:#157fe0!important;
+  border:1px solid #2d9cff!important;
+  font-size:13px!important;
+  font-weight:800!important;
+}
+
+/* top10 table: compact and high-density */
+.table-wrap{
+  border:none!important;
+  border-radius:0!important;
+  background:#08131e!important;
+}
+.stock-table{
+  min-width:1320px!important;
+  font-size:11px!important;
+}
+.stock-table th{
+  background:#0c1a27!important;
+  padding:7px 5px!important;
+  border-color:#28445b!important;
+  font-weight:800!important;
+}
+.stock-table td{
+  padding:7px 5px!important;
+  background:#091521!important;
+  border-color:#18344a!important;
+}
+.stock-table tr:nth-child(even) td{background:#0a1824!important}
+.stock-table tr:hover td{background:#102336!important}
+.stock-table .price{color:#ffd05c!important}
+.stock-table .up{color:#ff696f!important}
+.stock-table .down{color:#56d388!important}
+.stock-table .volr{color:#ffb33b!important}
+.stock-table .grade{color:#dcecff!important}
+
+/* legends in 4 equal cards */
+.legend-grid{
+  grid-template-columns:repeat(4,1fr)!important;
+  gap:8px!important;
+  margin-top:8px!important;
+}
+.legend{
+  min-height:250px!important;
+  padding:11px!important;
+  border-radius:6px!important;
+  background:#0a1724!important;
+  border:1px solid #1e3a52!important;
+}
+.legend h4{font-size:15px!important;color:#4eb1ff!important}
+.legend p,.legend li{font-size:11px!important;line-height:1.75!important}
+
+/* dataframe/other native widgets */
+[data-testid="stDataFrame"],[data-testid="stDataFrameResizable"]{
+  background:#091521!important;
+  border:1px solid #1e3e58!important;
+  border-radius:6px!important;
+}
+[data-testid="stAlert"]{
+  background:#0a1b29!important;
+  border-color:#24516f!important;
+}
+
+/* mobile */
+@media(max-width:900px){
+  .block-container{padding:8px 7px 20px!important}
+  .hero-title{font-size:23px!important}
+  .hero-sub{font-size:11px!important}
+  .hero-meta{display:none!important}
+  .navbar{grid-template-columns:repeat(5,118px)!important;overflow-x:auto!important}
+  .summary-grid{grid-template-columns:repeat(2,1fr)!important}
+  .summary-card{min-height:104px!important}
+  .legend-grid{grid-template-columns:1fr!important}
+}
+</style>
+''', unsafe_allow_html=True)
