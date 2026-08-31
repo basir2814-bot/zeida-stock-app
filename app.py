@@ -608,28 +608,30 @@ if "snap" in st.session_state:
             bias=s1=s2=r1=r2=risk=rr=np.nan; grade="觀察"; vr=np.nan
 
         cls="up" if z_chg >= 0 else "down"
-        trs.append(f"""
-        <tr>
-          <td class="rank">{rank}</td><td class="code">{z.stock_id}</td><td>{z.stock_name}</td>
-          <td class="price">{price2(z_close)}</td><td class="{cls}">{signed_pct(z_chg)}</td>
-          <td>{money_yi(z_activity)}</td><td class="volr">{f2(vr)}</td>
-          <td>{flagtxt}</td><td>{tech:.1f}</td><td>{chip:.1f}</td>
-          <td class="volr">{f2(bias)}%</td>
-          <td>{f1(s1)}</td><td>{f1(s2)}</td><td>{f1(r1)}</td><td>{f1(r2)}</td>
-          <td class="{risk_class(risk)}">{'-' if not finite(risk) else int(risk)}</td>
-          <td class="rr">{f2(rr)}</td><td class="grade">{grade}</td>
-        </tr>
-        """)
+        trs.append(
+            f'<tr>'
+            f'<td class="rank">{rank}</td><td class="code">{z.stock_id}</td><td>{z.stock_name}</td>'
+            f'<td class="price">{price2(z_close)}</td><td class="{cls}">{signed_pct(z_chg)}</td>'
+            f'<td>{money_yi(z_activity)}</td><td class="volr">{f2(vr)}</td>'
+            f'<td>{flagtxt}</td><td>{tech:.1f}</td><td>{chip:.1f}</td>'
+            f'<td class="volr">{f2(bias)}%</td>'
+            f'<td>{f1(s1)}</td><td>{f1(s2)}</td><td>{f1(r1)}</td><td>{f1(r2)}</td>'
+            f'<td class="{risk_class(risk)}">{"-" if not finite(risk) else int(risk)}</td>'
+            f'<td class="rr">{f2(rr)}</td><td class="grade">{grade}</td>'
+            f'</tr>'
+        )
 
-    st.markdown("""
-    <div class="table-wrap"><table class="stock-table"><thead><tr>
-      <th>排名</th><th>代號</th><th>名稱</th><th>股價</th><th>漲跌幅</th><th>成交金額(億)</th><th>量比</th>
-      <th>賊大戰術 ①～⑧</th><th>技術分(60%)</th><th>籌碼分(20%)</th><th>乖離率(離季線)</th>
-      <th>支撐1</th><th>支撐2</th><th>壓力1</th><th>壓力2</th><th>風險係數</th><th>風報比</th><th>評等</th>
-    </tr></thead><tbody>
-    """+"".join(trs)+"""
-    </tbody></table></div>
-    """, unsafe_allow_html=True)
+    # HTML 前面不能保留 4 個以上空白，否則 Markdown 會把它當成程式碼區塊顯示原始 <td>。
+    table_html = (
+        '<div class="table-wrap"><table class="stock-table"><thead><tr>'
+        '<th>排名</th><th>代號</th><th>名稱</th><th>股價</th><th>漲跌幅</th><th>成交金額(億)</th><th>量比</th>'
+        '<th>賊大戰術 ①～⑧</th><th>技術分(60%)</th><th>籌碼分(20%)</th><th>乖離率(離季線)</th>'
+        '<th>支撐1</th><th>支撐2</th><th>壓力1</th><th>壓力2</th><th>風險係數</th><th>風報比</th><th>評等</th>'
+        '</tr></thead><tbody>'
+        + ''.join(trs) +
+        '</tbody></table></div>'
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("""
