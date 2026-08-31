@@ -376,36 +376,86 @@ if "snap" in st.session_state:
     top = snap.head(10).copy()
 
     st.success("✅ 全市場掃描完成")
-    c1,c2,c3 = st.columns(3)
-    c1.metric("通過基本條件",len(snap))
-    c2.metric("Top 10",len(top))
-    c3.metric("已補完整技術分析",len(details))
 
-    st.subheader("🏆 Top 10")
-    table = top[["stock_id","stock_name","market","close","lots","chg_pct","score_today"]].copy()
-    table.columns = ["代號","名稱","市場","收盤","成交量(張)","今日漲跌%","今日初篩分數"]
-    st.dataframe(table,hide_index=True,use_container_width=True)
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("通過初篩", len(snap))
+    c2.metric("Top 10", len(top))
+    c3.metric("完整分析", len(details))
+    c4.metric("低風險", sum(1 for k in top.stock_id if k in details and details[k]["risk"] <= 30))
 
-    st.caption("Top 10 一定先顯示；標示「完整」的股票可以直接看 K 線、型態、斜率、乖離、支撐壓力與風險。")
-    cols = st.columns(2)
-    for i,z in enumerate(top.itertuples(index=False)):
-        tag = "✅完整" if z.stock_id in details else "○今日"
-        if cols[i%2].button(
-            f"{z.stock_id} {z.stock_name}｜{tag}",
-            key=f"stock_{z.stock_id}",
+    st.markdown("## 🏆 Top 10 精選")
+    st.caption("手機版改成卡片：直接看分數、賊大條件、型態、乖離、支撐壓力、風險與風報比。")
+
+    for rank, z in enumerate(top.itertuples(index=False), start=1):
+        x = details.get(z.stock_id)
+        full = x is not None
+
+        if full:
+            score = x["score"]
+            cond = x["condition"]
+            patt = x["pattern"]
+            risk = x["risk"]
+            support = f'{x["support"]:.2f}' if finite(x["support"]) else "-"
+            resistance = f'{x["resistance"]:.2f}' if finite(x["resistance"]) else "-"
+            rr = f'{x["rr"]:.2f}' if finite(x["rr"]) else "-"
+            bias = f'5MA {x["bias5"]:.1f}% / 20MA {x["bias20"]:.1f}%' if finite(x["bias5"]) and finite(x["bias20"]) else "-"
+            slope_txt = slope_label(x["s20"])
+        else:
+            score = int(round(z.score_today))
+            cond = "今日強勢初篩"
+            patt = "待補歷史K線"
+            risk = "-"
+            support = "-"
+            resistance = "-"
+            rr = "-"
+            bias = "-"
+            slope_txt = "-"
+
+        st.markdown(
+            f"""
+            <div style="background:#0c1b2d;border:1px solid #24415f;border-radius:16px;
+                        padding:14px 14px 10px 14px;margin:10px 0;">
+              <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+                <div>
+                  <div style="font-size:13px;color:#8fa6bf;">#{rank}｜{z.market}</div>
+                  <div style="font-size:25px;font-weight:800;">{z.stock_id} {z.stock_name}</div>
+                </div>
+                <div style="font-size:26px;font-weight:800;">{score}</div>
+              </div>
+              <div style="margin-top:8px;font-size:15px;">
+                <b>條件</b> {cond}　｜　<b>型態</b> {patt}
+              </div>
+              <div style="margin-top:6px;font-size:14px;color:#cbd8e6;">
+                收盤 {z.close:.2f}　｜　成交量 {z.lots:,.0f} 張　｜　今日 {z.chg_pct:+.2f}%
+              </div>
+              <div style="margin-top:6px;font-size:14px;color:#cbd8e6;">
+                乖離 {bias}　｜　20MA斜率 {slope_txt}
+              </div>
+              <div style="margin-top:6px;font-size:14px;color:#cbd8e6;">
+                支撐 {support}　｜　壓力 {resistance}　｜　風險 {risk}　｜　風報比 {rr}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if st.button(
+            f"查看 {z.stock_id} {z.stock_name} 詳細走勢",
+            key=f"detail_{z.stock_id}",
             use_container_width=True
         ):
             st.session_state["selected"] = z.stock_id
 
     code = st.session_state.get("selected")
     if code:
-        row = top[top["stock_id"]==code]
+        row = top[top["stock_id"] == code]
         if not row.empty:
             row = row.iloc[0]
+
             if code not in details:
                 try:
-                    with st.spinner("單獨補抓這檔歷史K線…"):
-                        h = hist(code,row["market"])
+                    with st.spinner("補抓這檔歷史K線…"):
+                        h = hist(code, row["market"])
                         a = analyze(h) if not h.empty else None
                         if a is not None:
                             details[code] = a
@@ -414,29 +464,45 @@ if "snap" in st.session_state:
                     pass
 
             st.divider()
-            st.header(f"🔎 {code} {row['stock_name']}")
+            st.markdown(f"## 🔎 {code} {row['stock_name']} 詳細分析")
 
             if code in details:
                 x = details[code]
-                m = st.columns(5)
-                m[0].metric("賊大分數",x["score"])
-                m[1].metric("風險",f'{x["risk"]}/100')
-                m[2].metric("型態",x["pattern"])
-                m[3].metric("第一支撐",f'{x["support"]:.2f}' if finite(x["support"]) else "-")
-                m[4].metric("第一壓力",f'{x["resistance"]:.2f}' if finite(x["resistance"]) else "-")
 
-                st.plotly_chart(chart(x["data"],code,row["stock_name"]),use_container_width=True)
-                st.write(f"**賊大條件：** {x['condition']}")
-                st.write(f"**均線斜率：** MA5 {slope_label(x['s5'])}｜MA20 {slope_label(x['s20'])}｜MA60 {slope_label(x['s60'])}")
-                st.write(
-                    f"**乖離：** 5MA {x['bias5']:.1f}%｜20MA {x['bias20']:.1f}%｜60MA {x['bias60']:.1f}%"
-                    if finite(x["bias5"]) and finite(x["bias20"]) and finite(x["bias60"])
-                    else "**乖離：** 資料不足"
-                )
-                st.write(f"**RSI：** {x['rsi']:.1f}｜**KD：** {x['k']:.1f}/{x['d']:.1f}｜**量比：** {x['vr']:.2f}x")
-                if finite(x["rr"]):
-                    st.write(f"**風報比：** {x['rr']:.2f}")
+                m1,m2,m3,m4 = st.columns(4)
+                m1.metric("賊大分數", x["score"])
+                m2.metric("風險係數", f'{x["risk"]}/100')
+                m3.metric("型態", x["pattern"])
+                m4.metric("風報比", f'{x["rr"]:.2f}' if finite(x["rr"]) else "-")
+
+                st.plotly_chart(chart(x["data"], code, row["stock_name"]), use_container_width=True)
+
+                a1,a2 = st.columns(2)
+                with a1:
+                    st.markdown("### 趨勢 / 斜率")
+                    st.write(f"MA5：{slope_label(x['s5'])}")
+                    st.write(f"MA20：{slope_label(x['s20'])}")
+                    st.write(f"MA60：{slope_label(x['s60'])}")
+                    st.write(f"賊大條件：{x['condition']}")
+                with a2:
+                    st.markdown("### 支撐 / 壓力 / 乖離")
+                    st.write(f"第一支撐：{x['support']:.2f}" if finite(x["support"]) else "第一支撐：-")
+                    st.write(f"第一壓力：{x['resistance']:.2f}" if finite(x["resistance"]) else "第一壓力：-")
+                    if finite(x["bias5"]) and finite(x["bias20"]) and finite(x["bias60"]):
+                        st.write(f"乖離：5MA {x['bias5']:.1f}%｜20MA {x['bias20']:.1f}%｜60MA {x['bias60']:.1f}%")
+                    else:
+                        st.write("乖離：資料不足")
+
+                st.markdown("### 技術指標")
+                st.write(f"RSI：{x['rsi']:.1f}｜KD：{x['k']:.1f}/{x['d']:.1f}｜量比：{x['vr']:.2f}x")
+
+                if x["risk"] <= 30 and x["score"] >= 80:
+                    st.success("劇本：偏強，優先等支撐確認或突破量價確認，避免高乖離追價。")
+                elif x["risk"] >= 60:
+                    st.error("劇本：風險偏高，先等乖離收斂、支撐確認或斜率重新轉強。")
+                else:
+                    st.warning("劇本：觀察區，等量價、支撐與斜率進一步確認。")
             else:
-                st.info("這檔的免費歷史K線目前取不到，但全市場 Top 10 仍正常可用。")
+                st.info("這檔免費歷史K線目前取不到，但全市場 Top 10 仍可正常使用。")
 
 st.caption("免費穩定版 v2：TWSE/TPEx 官方盤後行情負責全市場排行；免費歷史K線僅做個股加值分析。")
