@@ -17,11 +17,157 @@ YAHOO_HOSTS = [
 HEAD = {"User-Agent": "Mozilla/5.0"}
 
 st.markdown("""
+
 <style>
-.stApp{background:#07111f;color:#eef5ff}
-.block-container{max-width:1450px;padding-top:1rem}
-[data-testid="stMetric"]{background:#0c1b2d;border:1px solid #24415f;border-radius:12px;padding:10px}
+:root{
+  --bg:#07111d;
+  --panel:#0b1725;
+  --panel2:#0e1d2e;
+  --line:#1c3a58;
+  --line2:#23517a;
+  --text:#eef6ff;
+  --muted:#9fb1c2;
+  --blue:#2d9cff;
+  --green:#35d07f;
+  --orange:#ffad32;
+  --red:#ff5e63;
+  --purple:#b36cff;
+  --cyan:#45d6ff;
+}
+html, body, [class*="css"] {font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",sans-serif;}
+.stApp{
+  background:
+    radial-gradient(circle at 20% 0%, rgba(28,86,140,.18), transparent 30%),
+    linear-gradient(180deg,#06101b 0%,#081522 100%);
+  color:var(--text);
+}
+.block-container{max-width:1480px;padding-top:1.2rem;padding-bottom:2rem;}
+[data-testid="stHeader"]{background:transparent;}
+[data-testid="stToolbar"]{right:12px;}
+
+.hero{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:18px 22px;border:1px solid var(--line2);border-radius:12px;
+  background:linear-gradient(180deg,rgba(13,30,47,.96),rgba(7,20,33,.96));
+  box-shadow:0 12px 28px rgba(0,0,0,.22);
+  margin-bottom:10px;
+}
+.hero-left{display:flex;align-items:center;gap:14px;}
+.hero-icon{font-size:38px;filter:drop-shadow(0 0 10px rgba(45,156,255,.25));}
+.hero-title{font-size:30px;font-weight:900;letter-spacing:.4px;color:#fff;}
+.hero-title .pro{color:var(--orange);}
+.hero-sub{font-size:14px;color:#c6d4e3;margin-top:4px;}
+.hero-meta{text-align:right;font-size:13px;color:#b8c6d5;line-height:1.7;}
+.badge-live{color:#6df3a6;font-weight:700;}
+
+.navbar{
+  display:grid;grid-template-columns:repeat(5,1fr);
+  border:1px solid var(--line);border-radius:10px;overflow:hidden;
+  background:#0a1725;margin-bottom:12px;
+}
+.navitem{padding:12px 10px;text-align:center;border-right:1px solid #18324d;color:#c8d5e3;font-weight:700;}
+.navitem:last-child{border-right:none;}
+.navitem.active{background:linear-gradient(180deg,#0b3156,#0a2440);color:#68baff;box-shadow:inset 0 -2px 0 #1f9dff;}
+
+.section{
+  border:1px solid var(--line);border-radius:12px;background:rgba(9,23,37,.92);
+  padding:14px;margin:12px 0;
+}
+.section-title{
+  font-size:18px;font-weight:900;color:#5eb6ff;margin:0 0 12px 0;
+  display:flex;align-items:center;gap:8px;
+}
+.summary-grid{
+  display:grid;grid-template-columns:repeat(6,minmax(150px,1fr));gap:10px;
+}
+.summary-card{
+  min-height:118px;border:1px solid #21435f;border-radius:10px;
+  background:linear-gradient(180deg,#0c1b2a,#091624);
+  padding:12px 14px;display:flex;flex-direction:column;justify-content:center;
+}
+.summary-card .label{font-size:14px;color:#d5e0eb;margin-bottom:8px;}
+.summary-card .big{font-size:28px;font-weight:900;letter-spacing:.4px;}
+.summary-card .small{font-size:12px;color:#9eb1c4;margin-top:6px;line-height:1.5;}
+.summary-card.green .big{color:var(--green);}
+.summary-card.orange .big{color:var(--orange);}
+.summary-card.purple .big{color:var(--purple);}
+.summary-card.red{border-color:#ad3f48;box-shadow:0 0 0 1px rgba(255,94,99,.12);}
+.summary-card.red .big{color:var(--red);}
+.summary-card.blue .big{color:#49a8ff;}
+
+.filterbox{
+  border:1px solid var(--line);border-radius:12px;background:#091725;padding:14px 14px 4px;margin:12px 0;
+}
+[data-testid="stSelectbox"] label, [data-testid="stNumberInput"] label{font-size:12px!important;color:#b8c8d8!important;}
+.stSelectbox div[data-baseweb="select"]>div{background:#0b1b2c;border-color:#274a6b;color:#eef6ff;}
+.stButton>button{
+  background:linear-gradient(180deg,#1591ff,#0873d1);color:white;border:1px solid #4cb2ff;
+  border-radius:8px;font-weight:800;min-height:40px;
+}
+.stButton>button:hover{border-color:#88caff;color:#fff;}
+
+.panel{
+  border:1px solid var(--line);border-radius:12px;background:#091725;
+  padding:12px 12px 14px;margin:12px 0;
+}
+.panel-title{font-size:19px;font-weight:900;color:#5eb6ff;margin-bottom:10px;}
+
+.table-wrap{overflow-x:auto;border:1px solid #1d3d59;border-radius:9px;background:#07131f;}
+.stock-table{border-collapse:separate;border-spacing:0;width:100%;min-width:1500px;font-size:12px;color:#dbe8f5;}
+.stock-table th{
+  position:sticky;top:0;z-index:2;background:#0e2235;color:#d8e6f4;
+  padding:9px 7px;border-right:1px solid #24445f;border-bottom:1px solid #355b79;white-space:nowrap;
+}
+.stock-table td{
+  padding:8px 7px;border-right:1px solid #18334b;border-bottom:1px solid #173148;
+  white-space:nowrap;text-align:center;
+}
+.stock-table tr:hover td{background:#0d2031;}
+.stock-table .rank{font-weight:900;color:#fff;}
+.stock-table .code{color:#77bbff;font-weight:800;}
+.stock-table .price{font-weight:900;color:#ffd36a;}
+.stock-table .up{color:#ff696f;font-weight:900;}
+.stock-table .down{color:#5ad68a;font-weight:900;}
+.stock-table .volr{color:#ffb34a;font-weight:800;}
+.stock-table .rr{color:#ffd45b;font-weight:900;}
+.stock-table .grade{color:#7af1af;font-weight:900;}
+.risk-low{color:#69e79f;font-weight:900;}
+.risk-mid{color:#ffbb4d;font-weight:900;}
+.risk-high{color:#ff6d73;font-weight:900;}
+
+.legend-grid{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px;
+}
+.legend{
+  border:1px solid #1d3d59;border-radius:10px;background:#0b1826;padding:12px;
+  min-height:210px;
+}
+.legend h4{margin:0 0 10px;color:#62b8ff;font-size:16px;}
+.legend p,.legend li{font-size:12px;line-height:1.7;color:#c5d2df;}
+
+.detail-grid{
+  display:grid;grid-template-columns:minmax(0,2.1fr) minmax(240px,.9fr) minmax(240px,.9fr);
+  gap:10px;
+}
+.detail-card{border:1px solid #1d3d59;border-radius:10px;background:#0b1826;padding:12px;}
+.metric-row{display:flex;justify-content:space-between;border-bottom:1px solid #173248;padding:7px 0;font-size:13px;}
+.metric-row:last-child{border-bottom:none;}
+.metric-row .k{color:#9eb0c2}.metric-row .v{font-weight:800;color:#eef6ff}
+
+@media(max-width:900px){
+  .block-container{padding-left:.6rem;padding-right:.6rem;}
+  .hero{padding:14px;align-items:flex-start}
+  .hero-title{font-size:24px}.hero-icon{font-size:30px}
+  .hero-meta{font-size:11px}
+  .navbar{grid-template-columns:repeat(5,minmax(110px,1fr));overflow-x:auto}
+  .navitem{font-size:12px}
+  .summary-grid{grid-template-columns:repeat(2,1fr)}
+  .summary-card{min-height:105px}
+  .legend-grid{grid-template-columns:1fr}
+  .detail-grid{grid-template-columns:1fr}
+}
 </style>
+
 """, unsafe_allow_html=True)
 
 def to_num(v):
@@ -470,6 +616,17 @@ st.markdown("""
  <div>🚀 全市場掃描</div><div>📊 大盤儀表板</div><div>◎ 自選股監控</div><div>⚙ 系統設定</div><div>❔ 使用說明</div>
 </div>
 """, unsafe_allow_html=True)
+
+st.markdown(
+    """<div class="navbar">
+      <div class="navitem active">🚀 全市場掃描</div>
+      <div class="navitem">📊 大盤儀表板</div>
+      <div class="navitem">◎ 自選股監控</div>
+      <div class="navitem">⚙ 系統設定</div>
+      <div class="navitem">❔ 使用說明</div>
+    </div>""",
+    unsafe_allow_html=True
+)
 
 # Scan filters - shaped like the mockup.
 st.markdown('<div class="panel"><div class="filter-head">初篩條件 <span style="font-size:12px;color:#9fb1c2">（可調整）</span></div></div>', unsafe_allow_html=True)
