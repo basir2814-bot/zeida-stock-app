@@ -10,7 +10,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-08-31-v6-tpex-fallback"
+APP_LOGIC_VERSION = "2026-08-31-v7-cond2-cond3-balanced"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -769,14 +769,14 @@ def analyze(raw):
 
         # ② 盤整待突破：真的要有一段橫盤，且尚未進入大漲狀態。
         long_base = (
-            finite(range20) and range20 <= 12
-            and finite(r20_now) and abs(r20_now) <= 10
-            and finite(bias20_now) and abs(bias20_now) <= 7
+            finite(range20) and range20 <= 15
+            and finite(r20_now) and abs(r20_now) <= 12
+            and finite(bias20_now) and abs(bias20_now) <= 8
         )
         if (
             long_base
-            and c >= hi20 * .965
-            and 1.00 <= vr <= 1.80
+            and c >= hi20 * .955
+            and 0.90 <= vr <= 2.00
             and not (finite(day_chg) and day_chg >= 6)
         ):
             zeida_tags.append("②盤整待突破")
@@ -806,15 +806,42 @@ def analyze(raw):
         big_up_count_5 = int((_chg5.tail(5) >= 5).sum())
 
         first_launch = (
-            finite(prior20_ret) and prior20_ret < 8
-            and finite(r40) and r40 < 18
+            finite(prior20_ret) and prior20_ret < 12
+            and finite(r40) and r40 < 22
             and big_up_count_5 <= 1
-            and vr >= 1.55
-            and c >= hi20 * .98
-            and (not finite(day_chg) or day_chg >= 2)
+            and vr >= 1.35
+            and c >= hi20 * .97
+            and (not finite(day_chg) or day_chg >= 1.5)
         )
         if first_launch:
             zeida_tags.append("③剛起動")
+
+        # ②/③ 接近成立候選：差一點點時也保留觀察，不與正式成立混淆。
+        near_tags = []
+
+        near_2 = (
+            finite(range20) and range20 <= 18
+            and finite(r20_now) and abs(r20_now) <= 15
+            and finite(bias20_now) and abs(bias20_now) <= 10
+            and c >= hi20 * .94
+            and 0.80 <= vr <= 2.20
+            and not (finite(day_chg) and day_chg >= 7)
+            and "②盤整待突破" not in zeida_tags
+        )
+        if near_2:
+            near_tags.append("②接近突破")
+
+        near_3 = (
+            finite(prior20_ret) and prior20_ret < 15
+            and finite(r40) and r40 < 25
+            and big_up_count_5 <= 1
+            and vr >= 1.20
+            and c >= hi20 * .95
+            and (not finite(day_chg) or day_chg >= 1.0)
+            and "③剛起動" not in zeida_tags
+        )
+        if near_3:
+            near_tags.append("③接近起動")
 
         # ① 強勢熱門：已形成短中期多頭，但不要離20MA過遠，避免把噴出段仍當「初期」。
         if (
@@ -867,6 +894,7 @@ def analyze(raw):
             "pattern": pattern,
             "condition": cond,
             "zeida_tags": zeida_tags,
+            "near_tags": near_tags,
             "primary_stage": primary_stage,
             "bias5": b5, "bias20": b20, "bias60": b60,
             "s5": s5, "s20": s20, "s60": s60,
@@ -1158,9 +1186,9 @@ def _backtest_signals(d):
         & (hist>=hist.shift(1)) & (x["daychg"]>0)
     )
     sig["②盤整待突破"] = (
-        (x["range20"]<=12) & (x["r20"].abs()<=10)
-        & (x["bias20"].abs()<=7) & (x["close"]>=x["hi20"]*.965)
-        & x["vr"].between(1.0,1.8) & (x["daychg"]<6)
+        (x["range20"]<=15) & (x["r20"].abs()<=12)
+        & (x["bias20"].abs()<=8) & (x["close"]>=x["hi20"]*.955)
+        & x["vr"].between(.9,2.0) & (x["daychg"]<6)
     )
     sig["⑧整理轉強"] = (
         (x["close"]>x["ma60"]) & (x["close"]>x["ma20"])
@@ -1175,10 +1203,10 @@ def _backtest_signals(d):
         .rolling(5, min_periods=1).sum()
     )
     sig["③剛起動"] = (
-        (x["prior20"]<8) & (x["r40"]<18)
+        (x["prior20"]<12) & (x["r40"]<22)
         & (x["bigup5"]<=1)
-        & (x["vr"]>=1.55) & (x["close"]>=x["hi20"]*.98)
-        & (x["daychg"]>=2)
+        & (x["vr"]>=1.35) & (x["close"]>=x["hi20"]*.97)
+        & (x["daychg"]>=1.5)
     )
     sig["①強勢熱門"] = (
         (x["ma5"]>x["ma10"])&(x["ma10"]>x["ma20"])&(x["close"]>x["ma20"])
@@ -1824,6 +1852,48 @@ if "snap" in st.session_state:
             },
         )
         st.caption(f"符合 {len(rows)} 檔，目前顯示 {len(df_cat)} 檔。")
+
+
+    # ② / ③ 接近成立候選
+    near_rows = []
+    for z in snap.itertuples(index=False):
+        a = details.get(z.stock_id)
+        if not a:
+            continue
+        for tag in a.get("near_tags", []):
+            near_rows.append({
+                "狀態": tag,
+                "代號": str(z.stock_id),
+                "名稱": str(z.stock_name),
+                "股價": float(z.close) if finite(z.close) else np.nan,
+                "漲跌幅%": float(z.chg_pct) if finite(z.chg_pct) else np.nan,
+                "成交金額(億)": float(z.activity)/1e8 if finite(z.activity) else np.nan,
+                "綜合分": float(z.final_score) if finite(z.final_score) else 0.0,
+                "風險": int(a["risk"]) if finite(a.get("risk")) else None,
+                "風報比": round(float(a["rr"]),2) if finite(a.get("rr")) else None,
+            })
+
+    if near_rows:
+        st.markdown(
+            '<div style="margin-top:18px;font-size:18px;font-weight:800;color:#ffbf52">🟡 ②／③ 接近成立候選</div>',
+            unsafe_allow_html=True
+        )
+        near_df = pd.DataFrame(near_rows).sort_values(
+            ["狀態","綜合分","風報比"], ascending=[True,False,False]
+        )
+        st.dataframe(
+            near_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "股價": st.column_config.NumberColumn(format="%.2f"),
+                "漲跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
+                "成交金額(億)": st.column_config.NumberColumn(format="%.1f"),
+                "綜合分": st.column_config.NumberColumn(format="%.1f"),
+                "風報比": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        st.caption("黃色候選＝接近條件，但尚未正式成立；避免因規則太嚴完全漏股。")
 
     st.markdown(
         '<div style="margin-top:14px;font-size:13px;line-height:1.8;color:#9fb1c2">'
