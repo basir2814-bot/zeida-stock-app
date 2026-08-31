@@ -10,7 +10,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-08-31-v5-cond3-cond7-fix"
+APP_LOGIC_VERSION = "2026-08-31-v6-tpex-fallback"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -439,23 +439,50 @@ def snapshot():
     except Exception as e:
         warnings.append(f"上市資料暫時無法取得：{type(e).__name__}")
 
-    try:
-        r = requests.get(TPEX, headers=HEAD, timeout=30)
-        r.raise_for_status()
-        for x in r.json():
-            code = str(pick(x, ["SecuritiesCompanyCode", "Code", "證券代號", "股票代號"]) or "").strip()
-            name = str(pick(x, ["CompanyName", "SecuritiesCompanyName", "Name", "證券名稱", "股票名稱"]) or "").strip()
-            close = to_num(pick(x, ["Close", "ClosingPrice", "收盤價"]))
-            opn = to_num(pick(x, ["Open", "OpeningPrice", "開盤價"]))
-            high = to_num(pick(x, ["High", "HighestPrice", "最高價"]))
-            low = to_num(pick(x, ["Low", "LowestPrice", "最低價"]))
-            vol = to_num(pick(x, ["TradingShares", "TradeVolume", "成交股數", "成交量"]))
-            val = to_num(pick(x, ["TransactionAmount", "TradeValue", "成交金額"]))
-            chg = to_num(pick(x, ["Change", "ChangePrice", "漲跌價差"]))
-            if re.fullmatch(r"\d{4}", code) and finite(close):
-                rows.append([code, name, "上櫃", close, opn, high, low, vol, val, chg])
-    except Exception as e:
-        warnings.append(f"上櫃資料暫時無法取得：{type(e).__name__}")
+    # 上櫃資料：TPEx 主來源 + 官方備援
+    tpex_ok = False
+    tpex_urls = [
+        TPEX,
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+    ]
+
+    for _url in tpex_urls:
+        try:
+            r = requests.get(_url, headers=HEAD, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or len(data) == 0:
+                continue
+
+            before = len(rows)
+            for x in data:
+                code = str(pick(x, [
+                    "SecuritiesCompanyCode", "SecuritiesCode", "Code",
+                    "證券代號", "股票代號"
+                ]) or "").strip()
+                name = str(pick(x, [
+                    "CompanyName", "SecuritiesCompanyName", "Name",
+                    "證券名稱", "股票名稱"
+                ]) or "").strip()
+                close = to_num(pick(x, ["Close", "ClosingPrice", "收盤價"]))
+                opn = to_num(pick(x, ["Open", "OpeningPrice", "開盤價"]))
+                high = to_num(pick(x, ["High", "HighestPrice", "最高價"]))
+                low = to_num(pick(x, ["Low", "LowestPrice", "最低價"]))
+                vol = to_num(pick(x, ["TradingShares", "TradeVolume", "成交股數", "成交量"]))
+                val = to_num(pick(x, ["TransactionAmount", "TradeValue", "成交金額"]))
+                chg = to_num(pick(x, ["Change", "ChangePrice", "漲跌價差"]))
+
+                if re.fullmatch(r"\d{4}", code) and finite(close):
+                    rows.append([code, name, "上櫃", close, opn, high, low, vol, val, chg])
+
+            if len(rows) > before:
+                tpex_ok = True
+                break
+        except Exception:
+            continue
+
+    if not tpex_ok:
+        warnings.append("上櫃資料暫時無法取得（TPEx 主來源與備援皆失敗）")
 
     d = pd.DataFrame(rows, columns=["stock_id","stock_name","market","close","open_today","high_today","low_today","volume","value","change"])
     if not d.empty:
