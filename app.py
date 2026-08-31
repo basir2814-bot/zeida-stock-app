@@ -548,12 +548,15 @@ if "snap" in st.session_state:
     details=st.session_state.get("details",{})
     inst=st.session_state.get("inst",{})
     top=snap.head(10).copy()
+    for _c in ["close","chg_pct","activity","final_score"]:
+        if _c in top.columns:
+            top[_c] = pd.to_numeric(top[_c], errors="coerce")
 
     market_all,_=snapshot()
     total=len(market_all)
     qualified=len(snap)
     full=len(details)
-    strong=sum(1 for k,v in details.items() if v["score"]>=80)
+    strong=sum(1 for k,v in details.items() if finite(v.get("score")) and float(v.get("score"))>=80)
 
     st.markdown('<div class="panel"><div class="panel-title">市場總覽</div>', unsafe_allow_html=True)
     st.markdown(f"""
@@ -572,39 +575,44 @@ if "snap" in st.session_state:
     trs=[]
     for rank,z in enumerate(top.itertuples(index=False),1):
         a=details.get(z.stock_id)
-        inst5=inst.get(z.stock_id,0.0)
+        inst5=float(inst.get(z.stock_id,0.0)) if finite(inst.get(z.stock_id,0.0)) else 0.0
+        z_chg = float(z.chg_pct) if finite(z.chg_pct) else 0.0
+        z_final = float(z.final_score) if finite(z.final_score) else 0.0
+        z_close = float(z.close) if finite(z.close) else np.nan
+        z_activity = float(z.activity) if finite(z.activity) else np.nan
         if a:
             dlast=a["data"].iloc[-1]
             flags=[
                 finite(dlast.get("ma5")) and finite(dlast.get("ma10")) and finite(dlast.get("ma20")) and float(dlast["ma5"])>float(dlast["ma10"])>float(dlast["ma20"]),
                 bool(a["ma60_up"]),
-                a["vr"]>=1.3,
+                finite(a.get("vr")) and float(a.get("vr"))>=1.3,
                 bool(a["kd_golden"]),
-                a["rsi"]>50,
+                finite(a.get("rsi")) and float(a.get("rsi"))>50,
                 bool(a["macd_positive"]),
                 inst5>0,
-                a["risk"]<=40,
+                finite(a.get("risk")) and float(a.get("risk"))<=40,
             ]
             flagtxt=" ".join("🟢" if x else "🔴" for x in flags)
-            tech=min(60,round(a["score"]*.60,1))
+            _score=float(a.get("score")) if finite(a.get("score")) else 0.0
+            tech=min(60,round(_score*.60,1))
             chip=20.0 if inst5>0 else 10.0 if inst5==0 else 4.0
             bias=a["bias60"]
             s1,s2=a["support"],a["support2"]
             r1,r2=a["resistance"],a["resistance2"]
             risk=a["risk"]; rr=a["rr"]
-            grade=grade_for(a["score"])
-            vr=a["vr"]
+            grade=grade_for(_score)
+            vr=float(a.get("vr")) if finite(a.get("vr")) else np.nan
         else:
             flagtxt="⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪"
-            tech=round(float(z.final_score)*.60,1); chip=0.0
+            tech=round(z_final*.60,1); chip=0.0
             bias=s1=s2=r1=r2=risk=rr=np.nan; grade="觀察"; vr=np.nan
 
-        cls="up" if z.chg_pct>=0 else "down"
+        cls="up" if z_chg >= 0 else "down"
         trs.append(f"""
         <tr>
           <td class="rank">{rank}</td><td class="code">{z.stock_id}</td><td>{z.stock_name}</td>
-          <td class="price">{price2(z.close)}</td><td class="{cls}">{signed_pct(z.chg_pct)}</td>
-          <td>{money_yi(z.activity)}</td><td class="volr">{f2(vr)}</td>
+          <td class="price">{price2(z_close)}</td><td class="{cls}">{signed_pct(z_chg)}</td>
+          <td>{money_yi(z_activity)}</td><td class="volr">{f2(vr)}</td>
           <td>{flagtxt}</td><td>{tech:.1f}</td><td>{chip:.1f}</td>
           <td class="volr">{f2(bias)}%</td>
           <td>{f1(s1)}</td><td>{f1(s2)}</td><td>{f1(r1)}</td><td>{f1(r2)}</td>
