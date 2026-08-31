@@ -8,6 +8,25 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", layout="wide")
 
+# ===== 選股邏輯版本 =====
+# 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
+APP_LOGIC_VERSION = "2026-08-31-v5-cond3-cond7-fix"
+
+if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
+    for _k in [
+        "snap", "details", "inst", "fundamentals", "shorts", "chips",
+        "top_show_n", "zeida_show_n"
+    ]:
+        st.session_state.pop(_k, None)
+    st.session_state["_logic_version"] = APP_LOGIC_VERSION
+    st.session_state["_logic_updated_notice"] = True
+
+
+
+
+if st.session_state.pop("_logic_updated_notice", False):
+    st.info("選股分類規則已更新，舊掃描結果已自動清除。請按一次「執行全市場掃描」重新計算。")
+
 st.markdown(r'''
 <style>
 /* ===== 賊大戰術 Pro：深色統一主題 v2 ===== */
@@ -409,11 +428,14 @@ def snapshot():
             code = str(pick(x, ["Code", "證券代號", "股票代號"]) or "").strip()
             name = str(pick(x, ["Name", "證券名稱", "股票名稱"]) or "").strip()
             close = to_num(pick(x, ["ClosingPrice", "收盤價", "Close"]))
+            opn = to_num(pick(x, ["OpeningPrice", "開盤價", "Open"]))
+            high = to_num(pick(x, ["HighestPrice", "最高價", "High"]))
+            low = to_num(pick(x, ["LowestPrice", "最低價", "Low"]))
             vol = to_num(pick(x, ["TradeVolume", "成交股數", "Trading_Volume"]))
             val = to_num(pick(x, ["TradeValue", "成交金額", "Trading_money"]))
             chg = to_num(pick(x, ["Change", "漲跌價差", "ChangePrice"]))
             if re.fullmatch(r"\d{4}", code) and finite(close):
-                rows.append([code, name, "上市", close, vol, val, chg])
+                rows.append([code, name, "上市", close, opn, high, low, vol, val, chg])
     except Exception as e:
         warnings.append(f"上市資料暫時無法取得：{type(e).__name__}")
 
@@ -424,19 +446,65 @@ def snapshot():
             code = str(pick(x, ["SecuritiesCompanyCode", "Code", "證券代號", "股票代號"]) or "").strip()
             name = str(pick(x, ["CompanyName", "SecuritiesCompanyName", "Name", "證券名稱", "股票名稱"]) or "").strip()
             close = to_num(pick(x, ["Close", "ClosingPrice", "收盤價"]))
+            opn = to_num(pick(x, ["Open", "OpeningPrice", "開盤價"]))
+            high = to_num(pick(x, ["High", "HighestPrice", "最高價"]))
+            low = to_num(pick(x, ["Low", "LowestPrice", "最低價"]))
             vol = to_num(pick(x, ["TradingShares", "TradeVolume", "成交股數", "成交量"]))
             val = to_num(pick(x, ["TransactionAmount", "TradeValue", "成交金額"]))
             chg = to_num(pick(x, ["Change", "ChangePrice", "漲跌價差"]))
             if re.fullmatch(r"\d{4}", code) and finite(close):
-                rows.append([code, name, "上櫃", close, vol, val, chg])
+                rows.append([code, name, "上櫃", close, opn, high, low, vol, val, chg])
     except Exception as e:
         warnings.append(f"上櫃資料暫時無法取得：{type(e).__name__}")
 
-    d = pd.DataFrame(rows, columns=["stock_id","stock_name","market","close","volume","value","change"])
+    d = pd.DataFrame(rows, columns=["stock_id","stock_name","market","close","open_today","high_today","low_today","volume","value","change"])
     if not d.empty:
         d = d.drop_duplicates("stock_id")
         d = d[~d.stock_name.astype(str).str.contains("ETF|ETN|權證|指數|債", case=False, na=False)]
     return d, warnings
+
+
+def merge_today_bar(h, z):
+    """
+    Yahoo 日K有時盤中/盤後尚未包含今天。
+    用 TWSE/TPEx 官方今日快照補上今天，避免分類仍在看昨天。
+    """
+    if h is None or h.empty:
+        return h
+    try:
+        d = h.copy()
+        today = pd.Timestamp.now(tz="Asia/Taipei").tz_localize(None).normalize()
+
+        close = float(z.close) if finite(z.close) else np.nan
+        if not finite(close):
+            return d
+
+        prev_close = close - float(z.change) if finite(z.change) else close
+        opn = float(z.open_today) if hasattr(z, "open_today") and finite(z.open_today) else prev_close
+        high = float(z.high_today) if hasattr(z, "high_today") and finite(z.high_today) else max(opn, close)
+        low = float(z.low_today) if hasattr(z, "low_today") and finite(z.low_today) else min(opn, close)
+        vol = float(z.volume) if finite(z.volume) else 0.0
+
+        bar = {
+            "date": today,
+            "open": opn,
+            "max": high,
+            "min": low,
+            "close": close,
+            "volume": vol,
+        }
+
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        same = d["date"].dt.normalize() == today
+        if same.any():
+            for k,v in bar.items():
+                d.loc[same, k] = v
+        else:
+            d = pd.concat([d, pd.DataFrame([bar])], ignore_index=True)
+
+        return d.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    except Exception:
+        return h
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def hist(code, market):
@@ -630,41 +698,141 @@ def analyze(raw):
         risk = int(round(min(100, risk_vol+risk_dd+risk_volume+risk_signal)))
 
         # 賊大 8 大選股分類（資金生命週期）
-        # ⑤需要營收/EPS基本面資料，現階段不硬猜，避免把純技術強勢股誤標成營運成長股。
+        # 這裡只做「價格 / 成交量 / 均線」階段判讀。
+        # ⑤基本面、⑥/⑧融券確認會在外部資料抓回後再補強。
         zeida_tags = []
 
-        # ① 強勢熱門小型股：趨勢強、量能活、接近近期高點
-        if gt(ma5, ma10) and gt(ma10, ma20) and gt(c, ma20) and vr >= 1.20 and c >= hi20 * .97:
-            zeida_tags.append("①強勢熱門")
-
-        # ② 盤整待突破：20日區間收斂、靠近區間上緣、量能開始增加
+        day_chg = pct(c, d["close"].iloc[-2]) if len(d) >= 2 else np.nan
+        r20_now = pct(c, d["close"].iloc[-21]) if len(d) > 21 else np.nan
+        bias20_now = pct(c, ma20)
+        bias60_now = pct(c, ma60)
         range20 = ((hi20 - lo20) / lo20 * 100) if lo20 > 0 else np.nan
-        if finite(range20) and range20 <= 12 and c >= hi20 * .965 and vr >= 1.05:
-            zeida_tags.append("②盤整待突破")
 
-        # ③ 剛起動：過去40日漲幅還不大，今日/近期量能突然放大並逼近高點
-        if finite(r40) and -5 <= r40 < 22 and vr >= 1.60 and c >= hi20 * .985:
-            zeida_tags.append("③剛起動")
+        hi60 = float(d["max"].tail(min(60,len(d))).max())
+        lo60 = float(d["min"].tail(min(60,len(d))).min())
+        r60 = pct(c, d["close"].iloc[-61]) if len(d) > 61 else np.nan
+        from_hi60 = pct(c, hi60) if finite(hi60) else np.nan
 
-        # ④ 強勢股拉回：前波40日已有明顯漲幅，從40日高點回落，但仍守中短均線
-        if finite(r40) and r40 >= 25 and finite(from_hi) and -15 <= from_hi <= -2 and gt(c, ma20) and vr <= 1.50:
-            zeida_tags.append("④強勢股拉回")
+        ma5_series = d["close"].rolling(5).mean()
+        prev5_below = False
+        if len(d) >= 6:
+            _recent_close = d["close"].iloc[-6:-1]
+            _recent_ma5 = ma5_series.iloc[-6:-1]
+            prev5_below = bool((_recent_close < _recent_ma5).fillna(False).any())
+        reclaimed_ma5 = prev5_below and gt(c, ma5)
 
-        # ⑤ 營運成長潛力：需基本面資料，這版先保留欄位，不用技術面冒充基本面。
-
-        # ⑥ 強勢噴出／軋空中：前波已強、再創近期高，且量能明顯擴大
-        if finite(r40) and r40 >= 30 and c >= hi40 * .99 and vr >= 1.40:
-            zeida_tags.append("⑥強勢噴出")
-
-        # ⑦ 跌深轉折出量：40日仍弱，但重新站上20MA且爆量
-        if finite(r40) and r40 < 0 and gt(c, ma20) and vr >= 1.70 and hist_now >= hist_prev:
+        # ⑦ 跌深轉折：先要求真的「跌深」，避免一般整理誤判成底部反轉。
+        deep_decline = (
+            (finite(r60) and r60 <= -20)
+            or (finite(from_hi60) and from_hi60 <= -25)
+        )
+        near_ma20_after_turn = (
+            finite(bias20_now)
+            and -3 <= bias20_now <= 10
+        )
+        if (
+            deep_decline
+            and gt(c, ma20)
+            and near_ma20_after_turn
+            and vr >= 1.60
+            and hist_now >= hist_prev
+            and (not finite(day_chg) or day_chg > 0)
+        ):
             zeida_tags.append("⑦跌深轉折")
 
-        # ⑧ 整理轉強／軋空前：站上中期均線、20MA走升，但尚未大噴出
-        if gt(c, ma60) and finite(s20) and s20 > 0 and finite(r40) and r40 < 25 and 1.0 <= vr < 1.8:
+        # ② 盤整待突破：真的要有一段橫盤，且尚未進入大漲狀態。
+        long_base = (
+            finite(range20) and range20 <= 12
+            and finite(r20_now) and abs(r20_now) <= 10
+            and finite(bias20_now) and abs(bias20_now) <= 7
+        )
+        if (
+            long_base
+            and c >= hi20 * .965
+            and 1.00 <= vr <= 1.80
+            and not (finite(day_chg) and day_chg >= 6)
+        ):
+            zeida_tags.append("②盤整待突破")
+
+        # ⑧ 整理轉強：站上中期均線、整理收斂、剛開始轉強，不能已噴出。
+        not_extended = (
+            finite(r40) and r40 < 20
+            and finite(r20_now) and r20_now < 12
+            and finite(bias20_now) and bias20_now < 7
+            and finite(bias60_now) and bias60_now < 12
+        )
+        still_consolidating = finite(range20) and range20 <= 16
+        if (
+            gt(c, ma60) and gt(c, ma20)
+            and finite(s20) and s20 > 0
+            and not_extended and still_consolidating
+            and 0.90 <= vr < 1.70
+            and not (finite(day_chg) and day_chg >= 6)
+        ):
             zeida_tags.append("⑧整理轉強")
 
-        cond = zeida_tags[0] if zeida_tags else ("①強勢觀察" if gt(c, ma20) else "整理觀察")
+        # ③ 剛起動：前面漲幅不能大，現在才第一次放量攻擊。
+        prior20_ret = pct(d["close"].iloc[-2], d["close"].iloc[-22]) if len(d) > 22 else np.nan
+
+        # 近5日若已經出現2根以上「大漲K」，視為已經發動一段，不再算③第一次發動。
+        _chg5 = d["close"].pct_change() * 100
+        big_up_count_5 = int((_chg5.tail(5) >= 5).sum())
+
+        first_launch = (
+            finite(prior20_ret) and prior20_ret < 8
+            and finite(r40) and r40 < 18
+            and big_up_count_5 <= 1
+            and vr >= 1.55
+            and c >= hi20 * .98
+            and (not finite(day_chg) or day_chg >= 2)
+        )
+        if first_launch:
+            zeida_tags.append("③剛起動")
+
+        # ① 強勢熱門：已形成短中期多頭，但不要離20MA過遠，避免把噴出段仍當「初期」。
+        if (
+            gt(ma5, ma10) and gt(ma10, ma20) and gt(c, ma20)
+            and finite(r20_now) and 5 <= r20_now <= 28
+            and finite(bias20_now) and bias20_now <= 12
+            and vr >= 1.15 and c >= hi20 * .95
+        ):
+            zeida_tags.append("①強勢熱門")
+
+        # ④ 強勢股拉回：前40日已漲一大段，近期曾跌破5MA，現在處於洗盤/重新站回階段。
+        if (
+            finite(r40) and r40 >= 28
+            and finite(from_hi) and -16 <= from_hi <= -2
+            and gt(c, ma20)
+            and vr <= 1.55
+            and (prev5_below or reclaimed_ma5 or (finite(b5) and -4 <= b5 <= 4))
+        ):
+            zeida_tags.append("④強勢股拉回")
+
+        # ⑥ 強勢噴出：已脫離整理區、逼近40日高，避免再歸到⑧。
+        if (
+            finite(r40) and r40 >= 25
+            and c >= hi40 * .98
+            and (
+                vr >= 1.25
+                or (finite(bias20_now) and bias20_now >= 12)
+                or (finite(day_chg) and day_chg >= 6)
+            )
+        ):
+            zeida_tags.append("⑥強勢噴出")
+
+        # 同一檔可有次要標籤，但「主階段」採優先順序避免 3450 類型被前面的①/⑧蓋掉。
+        primary_priority = [
+            "⑥強勢噴出",
+            "④強勢股拉回",
+            "③剛起動",
+            "⑦跌深轉折",
+            "①強勢熱門",
+            "⑧整理轉強",
+            "②盤整待突破",
+        ]
+        primary_stage = next((x for x in primary_priority if x in zeida_tags), None)
+
+        cond = primary_stage if primary_stage else ("①強勢觀察" if gt(c, ma20) else "整理觀察")
 
         return {
             "score": int(max(0,min(100,round(score-risk*.1)))),
@@ -672,6 +840,7 @@ def analyze(raw):
             "pattern": pattern,
             "condition": cond,
             "zeida_tags": zeida_tags,
+            "primary_stage": primary_stage,
             "bias5": b5, "bias20": b20, "bias60": b60,
             "s5": s5, "s20": s20, "s60": s60,
             "support": support, "support2": support2,
@@ -922,7 +1091,7 @@ def fundamental_growth(code):
 
 
 def _backtest_signals(d):
-    """以當時可見資料產生①②③④⑥⑦⑧訊號，避免偷看未來。"""
+    """用與即時分類相同的核心技術條件回測，避免即時一套、回測另一套。"""
     x = d.copy().reset_index(drop=True)
     for k in [5,10,20,60]:
         x[f"ma{k}"] = x["close"].rolling(k).mean()
@@ -931,23 +1100,73 @@ def _backtest_signals(d):
     x["hi20"] = x["max"].rolling(20).max()
     x["lo20"] = x["min"].rolling(20).min()
     x["hi40"] = x["max"].rolling(40).max()
-    x["r40"] = (x["close"] / x["close"].shift(40) - 1) * 100
-    x["from_hi"] = (x["close"] / x["hi40"] - 1) * 100
+    x["hi60"] = x["max"].rolling(60).max()
+    x["r20"] = (x["close"]/x["close"].shift(20)-1)*100
+    x["r40"] = (x["close"]/x["close"].shift(40)-1)*100
+    x["r60"] = (x["close"]/x["close"].shift(60)-1)*100
+    x["prior20"] = (x["close"].shift(1)/x["close"].shift(21)-1)*100
+    x["daychg"] = (x["close"]/x["close"].shift(1)-1)*100
+    x["from_hi40"] = (x["close"]/x["hi40"]-1)*100
+    x["from_hi60"] = (x["close"]/x["hi60"]-1)*100
     x["range20"] = (x["hi20"]-x["lo20"]) / x["lo20"].replace(0,np.nan) * 100
+    x["bias20"] = (x["close"]/x["ma20"]-1)*100
+    x["bias60"] = (x["close"]/x["ma60"]-1)*100
     x["ma20_slope10"] = (x["ma20"]/x["ma20"].shift(10)-1)*100
 
     e12=x["close"].ewm(span=12,adjust=False).mean()
     e26=x["close"].ewm(span=26,adjust=False).mean()
     hist=(e12-e26)-(e12-e26).ewm(span=9,adjust=False).mean()
 
+    ma5 = x["ma5"]
+    prev_below5 = pd.Series(False,index=x.index)
+    for shift_n in range(1,6):
+        prev_below5 = prev_below5 | (x["close"].shift(shift_n) < ma5.shift(shift_n))
+
     sig = {}
-    sig["①強勢熱門"] = (x["ma5"]>x["ma10"])&(x["ma10"]>x["ma20"])&(x["close"]>x["ma20"])&(x["vr"]>=1.20)&(x["close"]>=x["hi20"]*.97)
-    sig["②盤整待突破"] = (x["range20"]<=12)&(x["close"]>=x["hi20"]*.965)&(x["vr"]>=1.05)
-    sig["③剛起動"] = x["r40"].between(-5,22)&(x["vr"]>=1.60)&(x["close"]>=x["hi20"]*.985)
-    sig["④強勢股拉回"] = (x["r40"]>=25)&x["from_hi"].between(-15,-2)&(x["close"]>x["ma20"])&(x["vr"]<=1.50)
-    sig["⑥強勢噴出"] = (x["r40"]>=30)&(x["close"]>=x["hi40"]*.99)&(x["vr"]>=1.40)
-    sig["⑦跌深轉折"] = (x["r40"]<0)&(x["close"]>x["ma20"])&(x["vr"]>=1.70)&(hist>=hist.shift(1))
-    sig["⑧整理轉強"] = (x["close"]>x["ma60"])&(x["ma20_slope10"]>0)&(x["r40"]<25)&x["vr"].between(1.0,1.8)
+    sig["⑦跌深轉折"] = (
+        ((x["r60"]<=-20)|(x["from_hi60"]<=-25))
+        & (x["close"]>x["ma20"])
+        & x["bias20"].between(-3,10)
+        & (x["vr"]>=1.60)
+        & (hist>=hist.shift(1)) & (x["daychg"]>0)
+    )
+    sig["②盤整待突破"] = (
+        (x["range20"]<=12) & (x["r20"].abs()<=10)
+        & (x["bias20"].abs()<=7) & (x["close"]>=x["hi20"]*.965)
+        & x["vr"].between(1.0,1.8) & (x["daychg"]<6)
+    )
+    sig["⑧整理轉強"] = (
+        (x["close"]>x["ma60"]) & (x["close"]>x["ma20"])
+        & (x["ma20_slope10"]>0)
+        & (x["r40"]<20) & (x["r20"]<12)
+        & (x["bias20"]<7) & (x["bias60"]<12)
+        & (x["range20"]<=16) & x["vr"].between(.9,1.7)
+        & (x["daychg"]<6)
+    )
+    x["bigup5"] = (
+        (x["daychg"]>=5).astype(int)
+        .rolling(5, min_periods=1).sum()
+    )
+    sig["③剛起動"] = (
+        (x["prior20"]<8) & (x["r40"]<18)
+        & (x["bigup5"]<=1)
+        & (x["vr"]>=1.55) & (x["close"]>=x["hi20"]*.98)
+        & (x["daychg"]>=2)
+    )
+    sig["①強勢熱門"] = (
+        (x["ma5"]>x["ma10"])&(x["ma10"]>x["ma20"])&(x["close"]>x["ma20"])
+        & x["r20"].between(5,28) & (x["bias20"]<=12)
+        & (x["vr"]>=1.15) & (x["close"]>=x["hi20"]*.95)
+    )
+    sig["④強勢股拉回"] = (
+        (x["r40"]>=28) & x["from_hi40"].between(-16,-2)
+        & (x["close"]>x["ma20"]) & (x["vr"]<=1.55)
+        & (prev_below5 | (x["bias20"].abs()<=4))
+    )
+    sig["⑥強勢噴出"] = (
+        (x["r40"]>=25) & (x["close"]>=x["hi40"]*.98)
+        & ((x["vr"]>=1.25)|(x["bias20"]>=12)|(x["daychg"]>=6))
+    )
     return x, sig
 
 
@@ -1323,40 +1542,80 @@ if scan:
             ).clip(0,100)
             snap = snap.sort_values(["broad_score","activity"],ascending=False).reset_index(drop=True)
 
-            target = snap.head(min(35,len(snap)))
+            target = snap.head(min(60,len(snap)))
             details, inst, fundamentals, shorts, chips = {}, {}, {}, {}, {}
             bar = st.progress(0,text="進行賊大①～⑧與技術分析…")
             for i,z in enumerate(target.itertuples(index=False)):
                 try:
                     h = hist(z.stock_id,z.market)
+                    h = merge_today_bar(h, z) if not h.empty else h
                     a = analyze(h) if not h.empty else None
                     if a is not None:
-                        # Apply the historical filters from the mockup.
-                        pass_month = (not finite(a["r20"])) or a["r20"] >= min_month
-                        pass_season = season_rule=="不限" or bool(a["ma60_up"])
-                        pass_kd = kd_rule=="不限" or bool(a["kd_golden"])
-                        if pass_month and pass_season and pass_kd:
-                            fund = fundamental_growth(z.stock_id)
-                            sh = short_interest_5d(z.stock_id)
-                            cp = chip_detail_5d(z.stock_id)
+                        # 賊大①～⑧分類必須先完整保留，不能被全域月漲幅/季線/KD先刪掉，
+                        # 否則④拉回與⑦跌深轉折會被系統性漏掉。
+                        fund = fundamental_growth(z.stock_id)
+                        sh = short_interest_5d(z.stock_id)
+                        cp = chip_detail_5d(z.stock_id)
 
-                            # 條件⑤正式接入基本面
-                            if fund.get("pass") and "⑤營運成長潛力" not in a["zeida_tags"]:
-                                a["zeida_tags"].append("⑤營運成長潛力")
+                        # ⑤營運成長：基本面獨立成立，不拿技術面冒充。
+                        if fund.get("pass") and "⑤營運成長潛力" not in a["zeida_tags"]:
+                            a["zeida_tags"].append("⑤營運成長潛力")
 
-                            # 條件⑥ / ⑧ 增加融券確認標籤（資料取得時）
-                            a["short_balance"] = sh.get("balance", np.nan)
-                            a["short_change5"] = sh.get("change5", np.nan)
-                            a["foreign5"] = cp.get("foreign", 0.0)
-                            a["trust5"] = cp.get("trust", 0.0)
-                            a["dealer5"] = cp.get("dealer", 0.0)
-                            a["fundamental"] = fund
+                        a["short_balance"] = sh.get("balance", np.nan)
+                        a["short_change5"] = sh.get("change5", np.nan)
+                        a["foreign5"] = cp.get("foreign", 0.0)
+                        a["trust5"] = cp.get("trust", 0.0)
+                        a["dealer5"] = cp.get("dealer", 0.0)
+                        a["fundamental"] = fund
 
-                            details[z.stock_id] = a
-                            inst[z.stock_id] = cp.get("total", 0.0)
-                            fundamentals[z.stock_id] = fund
-                            shorts[z.stock_id] = sh
-                            chips[z.stock_id] = cp
+                        # ⑧原圖要求「融券增加」：若融券資料有取得但沒有增加，移除⑧。
+                        if "⑧整理轉強" in a["zeida_tags"] and finite(a["short_change5"]) and a["short_change5"] <= 0:
+                            a["zeida_tags"].remove("⑧整理轉強")
+
+                        # ⑥標記是否有軋空跡象；沒有融券資料時只當「強勢噴出」，不硬說軋空。
+                        a["squeeze_confirmed"] = bool(
+                            "⑥強勢噴出" in a["zeida_tags"]
+                            and finite(a["short_balance"])
+                            and a["short_balance"] > 0
+                        )
+
+                        # 防呆：③不能是已經連續發動多日的股票。
+                        _a_data = a.get("data")
+                        if _a_data is not None and not _a_data.empty and "③剛起動" in a["zeida_tags"]:
+                            _recent_chg = _a_data["close"].pct_change().tail(5) * 100
+                            if int((_recent_chg >= 5).sum()) >= 2:
+                                a["zeida_tags"].remove("③剛起動")
+                                if "①強勢熱門" not in a["zeida_tags"] and "⑥強勢噴出" not in a["zeida_tags"]:
+                                    a["zeida_tags"].append("①強勢熱門")
+
+                        # 防呆：⑧整理轉強不允許當日已經大漲 ≥6%。
+                        # 新規則正常情況下本來就不會進⑧；這裡防止舊/異常資料污染。
+                        _today_chg = float(z.chg_pct) if finite(z.chg_pct) else np.nan
+                        if "⑧整理轉強" in a["zeida_tags"] and finite(_today_chg) and _today_chg >= 6:
+                            a["zeida_tags"].remove("⑧整理轉強")
+                            if "⑥強勢噴出" not in a["zeida_tags"]:
+                                a["zeida_tags"].append("⑥強勢噴出")
+
+                        # 防呆：⑦跌深轉折如果已經明顯高於20MA超過15%，不再視為「底部剛發動」。
+                        if "⑦跌深轉折" in a["zeida_tags"] and finite(a.get("bias20")) and a["bias20"] > 15:
+                            a["zeida_tags"].remove("⑦跌深轉折")
+
+                        # 重新決定主階段
+                        _prio = ["⑥強勢噴出","④強勢股拉回","③剛起動","⑦跌深轉折","①強勢熱門","⑧整理轉強","②盤整待突破","⑤營運成長潛力"]
+                        a["primary_stage"] = next((x for x in _prio if x in a["zeida_tags"]), a.get("primary_stage"))
+
+                        # 使用者畫面上的可調條件只影響「強勢排行」，不影響賊大分類是否被保留。
+                        a["ui_filter_pass"] = (
+                            ((not finite(a["r20"])) or a["r20"] >= min_month)
+                            and (season_rule=="不限" or bool(a["ma60_up"]))
+                            and (kd_rule=="不限" or bool(a["kd_golden"]))
+                        )
+
+                        details[z.stock_id] = a
+                        inst[z.stock_id] = cp.get("total", 0.0)
+                        fundamentals[z.stock_id] = fund
+                        shorts[z.stock_id] = sh
+                        chips[z.stock_id] = cp
                 except:
                     pass
                 bar.progress((i+1)/max(len(target),1),text=f"深度分析 {i+1}/{len(target)}")
@@ -1425,6 +1684,7 @@ if "snap" in st.session_state:
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ===== 賊大選股：直接把 8 大條件的股票全部選出來 =====
+    st.caption(f"選股邏輯版本：{APP_LOGIC_VERSION}")
     st.markdown(
         '<div class="panel"><div class="panel-title">🥷 賊大選股 '
         '<span style="font-size:12px;color:#9fb1c2">（直接掃出條件一～八）</span></div>',
@@ -1471,10 +1731,16 @@ if "snap" in st.session_state:
             continue
 
         tags = a.get("zeida_tags", [])
+        primary = a.get("primary_stage")
         for label in zeida_labels:
             target_tag = tag_map[label]
-            if target_tag not in tags:
-                continue
+            # ⑤是獨立基本面條件可額外顯示；其他①②③④⑥⑦⑧只放主階段，避免重複誤導。
+            if target_tag == "⑤營運成長潛力":
+                if target_tag not in tags:
+                    continue
+            else:
+                if primary != target_tag:
+                    continue
 
             category_rows[label].append({
                 "代號": str(z.stock_id),
