@@ -213,7 +213,9 @@ def analyze(raw):
         supports = sorted({round(v,2) for v in vals if v < c*.998}, reverse=True)
         resistances = sorted({round(v,2) for v in vals if v > c*1.002})
         support = supports[0] if supports else np.nan
+        support2 = supports[1] if len(supports) > 1 else np.nan
         resistance = resistances[0] if resistances else np.nan
+        resistance2 = resistances[1] if len(resistances) > 1 else np.nan
         rr = ((resistance-c)/(c-support)
               if finite(support) and finite(resistance) and c > float(support) else np.nan)
 
@@ -289,8 +291,13 @@ def analyze(raw):
             "condition": cond,
             "bias5": b5, "bias20": b20, "bias60": b60,
             "s5": s5, "s20": s20, "s60": s60,
-            "support": support, "resistance": resistance, "rr": rr,
+            "support": support, "support2": support2,
+            "resistance": resistance, "resistance2": resistance2, "rr": rr,
             "rsi": rsi_now, "k": k_now, "d": d_now, "vr": vr,
+            "r20": pct(c, d["close"].iloc[-21]) if len(d) > 21 else np.nan,
+            "ma60_up": gt(c, ma60),
+            "macd_positive": hist_now > 0,
+            "kd_golden": k_now > d_now,
             "data": d
         }
     except Exception:
@@ -308,201 +315,360 @@ def chart(d, code, name):
     fig.update_layout(template="plotly_dark",height=600,title=f"{code} {name}",xaxis_rangeslider_visible=False)
     return fig
 
-st.title("📈 賊大戰術 Pro｜免費穩定版 v2")
-st.caption("全市場先出 Top 10；任何單一股票的歷史K線分析失敗，都不會讓整個 App 當掉。")
 
-with st.sidebar:
-    minp = st.number_input("最低股價",1.0,300.0,5.0)
-    maxp = st.number_input("最高股價",10.0,3000.0,300.0)
-    minlots = st.number_input("最低成交量（張）",100,100000,500,100)
-    deep = st.slider("補完整技術分析檔數",3,15,8)
+FINMIND = "https://api.finmindtrade.com/api/v4/data"
 
-if st.button("🚀 全市場盤後掃描", type="primary", use_container_width=True):
+@st.cache_data(ttl=3600, show_spinner=False)
+def institutional_5d(code):
+    try:
+        end = pd.Timestamp.today().date()
+        start = end - pd.Timedelta(days=35)
+        r = requests.get(
+            FINMIND,
+            params={
+                "dataset":"TaiwanStockInstitutionalInvestorsBuySellWide",
+                "data_id":str(code),
+                "start_date":str(start),
+                "end_date":str(end),
+            },
+            headers=HEAD,
+            timeout=18
+        )
+        if r.status_code != 200:
+            return 0.0
+        j = r.json()
+        if j.get("status") not in (200, None):
+            return 0.0
+        d = pd.DataFrame(j.get("data", []))
+        if d.empty:
+            return 0.0
+        d = d.tail(5).copy()
+        total = 0.0
+        pairs = [
+            ("Foreign_Investor_buy","Foreign_Investor_sell"),
+            ("Investment_Trust_buy","Investment_Trust_sell"),
+            ("Dealer_self_buy","Dealer_self_sell"),
+            ("Dealer_Hedging_buy","Dealer_Hedging_sell"),
+        ]
+        used = False
+        for b,s in pairs:
+            if b in d.columns and s in d.columns:
+                total += (
+                    pd.to_numeric(d[b],errors="coerce").fillna(0)
+                    - pd.to_numeric(d[s],errors="coerce").fillna(0)
+                ).sum()
+                used = True
+        return float(total) if used else 0.0
+    except:
+        return 0.0
+
+def grade_for(score):
+    if score >= 90: return "S"
+    if score >= 80: return "A+"
+    if score >= 70: return "A"
+    if score >= 60: return "A-"
+    if score >= 50: return "B"
+    return "C"
+
+def risk_class(v):
+    if not finite(v): return ""
+    return "risk-low" if float(v) <= 30 else "risk-mid" if float(v) <= 60 else "risk-high"
+
+def f1(v, dash="-"):
+    return dash if not finite(v) else f"{float(v):.1f}"
+
+def f2(v, dash="-"):
+    return dash if not finite(v) else f"{float(v):.2f}"
+
+st.markdown("""
+<style>
+:root{
+  --bg:#07111d;--panel:#091827;--panel2:#0c1e30;--line:#25435f;--line2:#28577c;
+  --text:#ecf4fb;--muted:#94a9bc;--blue:#2d9dff;--green:#61d78c;--yellow:#f2b238;
+  --orange:#ff9c42;--red:#ff625f;
+}
+.stApp{background:radial-gradient(circle at top left,#0c1b32 0%,#07111d 44%,#050b12 100%);color:var(--text)}
+.block-container{max-width:1520px;padding-top:.45rem;padding-left:.65rem;padding-right:.65rem;padding-bottom:2rem}
+[data-testid="stHeader"]{background:transparent}
+[data-testid="stSidebar"]{display:none}
+.stButton>button{min-height:43px;border-radius:7px;border:1px solid #2575bb;background:#0d2b4a;color:#edf7ff;font-weight:850}
+.stButton>button:hover{border-color:#55b4ff;color:#fff}
+.hero{background:#081421;border:1px solid #203a55;border-radius:8px;padding:13px 15px;margin:5px 0 8px}
+.hero-title{font-size:31px;font-weight:950;line-height:1.05}.hero-title .pro{color:#ffc04a}
+.hero-sub{font-size:14px;color:#bdcddd;margin-top:5px}
+.nav{display:grid;grid-template-columns:repeat(5,1fr);border:1px solid #203b58;border-radius:7px;overflow:hidden;margin:0 0 10px}
+.nav div{background:#0a1724;padding:11px 5px;text-align:center;color:#d2dee9;font-weight:800;border-right:1px solid #203b58}
+.nav div:first-child{color:#5fb7ff;background:#0d2945;box-shadow:inset 0 0 0 1px #2b86d1}.nav div:last-child{border-right:0}
+.panel{background:#071522;border:1px solid #203b58;border-radius:8px;padding:11px 12px;margin:9px 0}
+.panel-title{color:#51adf5;font-size:18px;font-weight:900;margin-bottom:10px}
+.overview{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:9px}
+.ov{background:linear-gradient(180deg,#0a1928,#08141f);border:1px solid #27425d;border-radius:7px;text-align:center;padding:15px 9px;min-height:120px}
+.ov .t{font-size:14px;color:#d2dde7}.ov .v{font-size:31px;font-weight:950;margin-top:10px}.ov .s{font-size:13px;margin-top:5px;color:#9cb0c2}
+.ov.green .v,.ov.green .s{color:#67dc88}.ov.orange .v,.ov.orange .s{color:#f5aa37}.ov.red{border-color:#b33d40;box-shadow:inset 0 0 0 1px #8a2d30}.ov.red .v,.ov.red .s{color:#ff6c62}
+.filter-head{color:#4fa9ee;font-size:17px;font-weight:900}
+.table-wrap{overflow-x:auto;background:#06131f;border:1px solid #25445f;border-radius:7px}
+.stock-table{border-collapse:collapse;width:100%;min-width:1500px;font-size:12px}
+.stock-table th{background:#0e2235;color:#e6eef5;padding:8px 5px;border-right:1px solid #294a66;border-bottom:1px solid #2a506e;white-space:nowrap}
+.stock-table td{padding:8px 5px;text-align:center;border-right:1px solid #1c3449;border-bottom:1px solid #183047;color:#e9f0f7;white-space:nowrap}
+.stock-table tr:hover td{background:#0a1d2e}
+.rank{font-weight:900}.code{color:#74bbff;font-weight:900}.price{color:#ffc052;font-weight:900}.up{color:#ff7770;font-weight:900}.down{color:#61d78c;font-weight:900}
+.volr{color:#ff8556;font-weight:850}.risk-low{color:#69dc8d;font-weight:950}.risk-mid{color:#f1b13c;font-weight:950}.risk-high{color:#ff645e;font-weight:950}.rr{color:#f6a33e;font-weight:900}.grade{font-weight:950}
+.legend-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:10px}
+.legend{background:#071522;border:1px solid #203b58;border-radius:7px;padding:12px 13px;min-height:225px}.legend h4{color:#54aff4;margin:0 0 9px;font-size:17px}.legend p{color:#c7d4df;font-size:13px;line-height:1.5;margin:6px 0}
+.detail-grid{display:grid;grid-template-columns:1.5fr .9fr .9fr .9fr;gap:9px}.detail-box{background:#071522;border:1px solid #203b58;border-radius:7px;padding:11px}.detail-box h4{color:#54aff4;margin:0 0 8px}.detail-box p{color:#c8d5df;font-size:13px;line-height:1.55;margin:6px 0}
+.note{text-align:center;color:#94a9ba;font-size:12px;margin-top:12px}
+@media(max-width:900px){
+ .overview{grid-template-columns:repeat(2,1fr)} .legend-grid{grid-template-columns:1fr} .detail-grid{grid-template-columns:1fr}
+ .nav{grid-template-columns:1fr 1fr}.nav div{border-bottom:1px solid #203b58}.hero-title{font-size:27px}
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="hero">
+ <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap">
+  <div><div class="hero-title">🥷 賊大戰術 <span class="pro">Pro</span></div><div class="hero-sub">全市場智能選股系統（上市＋上櫃）</div></div>
+  <div style="color:#a1b3c4;font-size:13px">資料時間：盤後最新資料</div>
+ </div>
+</div>
+<div class="nav">
+ <div>🚀 全市場掃描</div><div>📊 大盤儀表板</div><div>◎ 自選股監控</div><div>⚙ 系統設定</div><div>❔ 使用說明</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Scan filters - shaped like the mockup.
+st.markdown('<div class="panel"><div class="filter-head">初篩條件 <span style="font-size:12px;color:#9fb1c2">（可調整）</span></div></div>', unsafe_allow_html=True)
+f1,f2,f3,f4,f5,f6 = st.columns(6)
+min_money = f1.selectbox("成交金額", [0.5,1.0,2.0,5.0], index=1, format_func=lambda x:f"≥ {x:g} 億")
+min_price = f2.selectbox("股價", [5.0,10.0,20.0,50.0], index=0, format_func=lambda x:f"≥ {x:g} 元")
+min_day = f3.selectbox("日漲跌幅", [0.0,1.0,2.0,3.0], index=1, format_func=lambda x:f"≥ {x:g}%")
+min_month = f4.selectbox("月漲跌幅", [0.0,3.0,5.0,10.0], index=2, format_func=lambda x:f"≥ {x:g}%")
+season_rule = f5.selectbox("季線位置", ["不限","站上季線"], index=1)
+kd_rule = f6.selectbox("KD 指標", ["不限","KD 黃金交叉"], index=1)
+
+scan = st.button("🔍 執行全市場掃描", type="primary", use_container_width=True)
+
+if scan:
     snap, warnings = snapshot()
     for w in warnings:
         st.warning(w)
 
     if snap.empty:
-        st.error("TWSE/TPEx 官方行情目前沒有取得，請稍後再試。")
+        st.error("TWSE/TPEx 官方行情目前沒有取得。")
     else:
-        snap["lots"] = pd.to_numeric(snap["volume"],errors="coerce").fillna(0)/1000
+        snap["lots"] = pd.to_numeric(snap["volume"], errors="coerce").fillna(0)/1000
+        snap["activity"] = snap["value"].where(
+            snap["value"].notna()&(snap["value"]>0),
+            snap["volume"]*snap["close"]
+        )
+        snap["chg_pct"] = (
+            pd.to_numeric(snap["change"],errors="coerce").fillna(0) /
+            snap["close"].replace(0,np.nan) * 100
+        ).replace([np.inf,-np.inf],np.nan).fillna(0)
+
+        # Official snapshot filters that can be applied across the whole market.
         snap = snap[
-            (snap["close"]>=minp)&(snap["close"]<=maxp)&(snap["lots"]>=minlots)
+            (snap["close"] >= min_price)
+            & (snap["activity"] >= min_money*1e8)
+            & (snap["chg_pct"] >= min_day)
         ].copy()
 
         if snap.empty:
-            st.warning("目前沒有股票通過你設定的股價/成交量條件。")
+            st.warning("目前沒有股票通過初篩條件。")
         else:
-            snap["activity"] = snap["value"].where(
-                snap["value"].notna()&(snap["value"]>0),
-                snap["volume"]*snap["close"]
-            )
-            snap["chg_pct"] = (
-                pd.to_numeric(snap["change"],errors="coerce").fillna(0) /
-                snap["close"].replace(0,np.nan) * 100
-            ).replace([np.inf,-np.inf],np.nan).fillna(0)
-
-            snap["score_today"] = (
-                50
+            # Rank broad market first; then deep-analyze the strongest 35 so month/MA/KD conditions can be used.
+            snap["broad_score"] = (
+                45
                 + snap["activity"].rank(pct=True)*25
                 + snap["lots"].rank(pct=True)*15
-                + snap["chg_pct"].clip(-10,10)
+                + snap["chg_pct"].clip(-10,10)*1.5
             ).clip(0,100)
+            snap = snap.sort_values(["broad_score","activity"],ascending=False).reset_index(drop=True)
 
-            snap = snap.sort_values(["score_today","activity"],ascending=False).reset_index(drop=True)
-
-            details = {}
-            bar = st.progress(0,text="補完整技術分析…")
-            target = snap.head(deep)
-
+            target = snap.head(min(35,len(snap)))
+            details, inst = {}, {}
+            bar = st.progress(0,text="進行賊大①～⑧與技術分析…")
             for i,z in enumerate(target.itertuples(index=False)):
                 try:
                     h = hist(z.stock_id,z.market)
                     a = analyze(h) if not h.empty else None
                     if a is not None:
-                        details[z.stock_id] = a
+                        # Apply the historical filters from the mockup.
+                        pass_month = (not finite(a["r20"])) or a["r20"] >= min_month
+                        pass_season = season_rule=="不限" or bool(a["ma60_up"])
+                        pass_kd = kd_rule=="不限" or bool(a["kd_golden"])
+                        if pass_month and pass_season and pass_kd:
+                            details[z.stock_id] = a
+                            inst[z.stock_id] = institutional_5d(z.stock_id)
                 except:
                     pass
-                bar.progress((i+1)/max(len(target),1), text=f"補分析 {i+1}/{len(target)}")
-                time.sleep(.05)
-
+                bar.progress((i+1)/max(len(target),1),text=f"深度分析 {i+1}/{len(target)}")
+                time.sleep(.04)
             bar.empty()
-            st.session_state["snap"] = snap
-            st.session_state["details"] = details
+
+            # Prefer full analyses; keep fallback rows so Top 10 still appears.
+            scored=[]
+            for z in snap.itertuples(index=False):
+                a=details.get(z.stock_id)
+                if a:
+                    tech = min(60, round(a["score"]*0.60,1))
+                    chip_raw = inst.get(z.stock_id,0.0)
+                    chip = 20.0 if chip_raw>0 else 10.0 if chip_raw==0 else 4.0
+                    risk_bonus = max(0,20-a["risk"]*0.20)
+                    final = tech+chip+risk_bonus
+                else:
+                    final = float(z.broad_score)*0.72
+                scored.append(final)
+            snap["final_score"]=scored
+            snap=snap.sort_values(["final_score","activity"],ascending=False).reset_index(drop=True)
+
+            st.session_state["snap"]=snap
+            st.session_state["details"]=details
+            st.session_state["inst"]=inst
 
 if "snap" in st.session_state:
-    snap = st.session_state["snap"]
-    details = st.session_state.get("details",{})
-    top = snap.head(10).copy()
+    snap=st.session_state["snap"]
+    details=st.session_state.get("details",{})
+    inst=st.session_state.get("inst",{})
+    top=snap.head(10).copy()
 
-    st.success("✅ 全市場掃描完成")
+    market_all,_=snapshot()
+    total=len(market_all)
+    qualified=len(snap)
+    full=len(details)
+    strong=sum(1 for k,v in details.items() if v["score"]>=80)
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("通過初篩", len(snap))
-    c2.metric("Top 10", len(top))
-    c3.metric("完整分析", len(details))
-    c4.metric("低風險", sum(1 for k in top.stock_id if k in details and details[k]["risk"] <= 30))
+    st.markdown('<div class="panel"><div class="panel-title">市場總覽</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="overview">
+      <div class="ov"><div class="t">上市＋上櫃 總檔數</div><div class="v">{total:,}</div><div class="s">全市場股票</div></div>
+      <div class="ov green"><div class="t">符合初篩檔數</div><div class="v">{qualified}</div><div class="s">{qualified/max(total,1)*100:.1f}%</div></div>
+      <div class="ov orange"><div class="t">進入賊大①～⑧檔數</div><div class="v">{full}</div><div class="s">{full/max(total,1)*100:.1f}%</div></div>
+      <div class="ov orange"><div class="t">強勢候選檔數</div><div class="v">{strong}</div><div class="s">深度分析80分以上</div></div>
+      <div class="ov red"><div class="t">🔥 Top 10 推薦</div><div class="v">{len(top)}</div><div class="s">🏆 今日精選</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("## 🏆 Top 10 精選")
-    st.caption("手機版改成卡片：直接看分數、賊大條件、型態、乖離、支撐壓力、風險與風報比。")
+    st.markdown('<div class="panel"><div class="panel-title">Top 10 強勢股 <span style="font-size:12px;color:#9fb1c2">（依綜合評分排序）</span></div>', unsafe_allow_html=True)
 
-    for rank, z in enumerate(top.itertuples(index=False), start=1):
-        x = details.get(z.stock_id)
-        full = x is not None
-
-        if full:
-            score = x["score"]
-            cond = x["condition"]
-            patt = x["pattern"]
-            risk = x["risk"]
-            support = f'{x["support"]:.2f}' if finite(x["support"]) else "-"
-            resistance = f'{x["resistance"]:.2f}' if finite(x["resistance"]) else "-"
-            rr = f'{x["rr"]:.2f}' if finite(x["rr"]) else "-"
-            bias = f'5MA {x["bias5"]:.1f}% / 20MA {x["bias20"]:.1f}%' if finite(x["bias5"]) and finite(x["bias20"]) else "-"
-            slope_txt = slope_label(x["s20"])
+    trs=[]
+    for rank,z in enumerate(top.itertuples(index=False),1):
+        a=details.get(z.stock_id)
+        inst5=inst.get(z.stock_id,0.0)
+        if a:
+            dlast=a["data"].iloc[-1]
+            flags=[
+                finite(dlast.get("ma5")) and finite(dlast.get("ma10")) and finite(dlast.get("ma20")) and float(dlast["ma5"])>float(dlast["ma10"])>float(dlast["ma20"]),
+                bool(a["ma60_up"]),
+                a["vr"]>=1.3,
+                bool(a["kd_golden"]),
+                a["rsi"]>50,
+                bool(a["macd_positive"]),
+                inst5>0,
+                a["risk"]<=40,
+            ]
+            flagtxt=" ".join("🟢" if x else "🔴" for x in flags)
+            tech=min(60,round(a["score"]*.60,1))
+            chip=20.0 if inst5>0 else 10.0 if inst5==0 else 4.0
+            bias=a["bias60"]
+            s1,s2=a["support"],a["support2"]
+            r1,r2=a["resistance"],a["resistance2"]
+            risk=a["risk"]; rr=a["rr"]
+            grade=grade_for(a["score"])
+            vr=a["vr"]
         else:
-            score = int(round(z.score_today))
-            cond = "今日強勢初篩"
-            patt = "待補歷史K線"
-            risk = "-"
-            support = "-"
-            resistance = "-"
-            rr = "-"
-            bias = "-"
-            slope_txt = "-"
+            flagtxt="⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪"
+            tech=round(float(z.final_score)*.60,1); chip=0.0
+            bias=s1=s2=r1=r2=risk=rr=np.nan; grade="觀察"; vr=np.nan
 
-        st.markdown(
-            f"""
-            <div style="background:#0c1b2d;border:1px solid #24415f;border-radius:16px;
-                        padding:14px 14px 10px 14px;margin:10px 0;">
-              <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-                <div>
-                  <div style="font-size:13px;color:#8fa6bf;">#{rank}｜{z.market}</div>
-                  <div style="font-size:25px;font-weight:800;">{z.stock_id} {z.stock_name}</div>
-                </div>
-                <div style="font-size:26px;font-weight:800;">{score}</div>
-              </div>
-              <div style="margin-top:8px;font-size:15px;">
-                <b>條件</b> {cond}　｜　<b>型態</b> {patt}
-              </div>
-              <div style="margin-top:6px;font-size:14px;color:#cbd8e6;">
-                收盤 {z.close:.2f}　｜　成交量 {z.lots:,.0f} 張　｜　今日 {z.chg_pct:+.2f}%
-              </div>
-              <div style="margin-top:6px;font-size:14px;color:#cbd8e6;">
-                乖離 {bias}　｜　20MA斜率 {slope_txt}
-              </div>
-              <div style="margin-top:6px;font-size:14px;color:#cbd8e6;">
-                支撐 {support}　｜　壓力 {resistance}　｜　風險 {risk}　｜　風報比 {rr}
-              </div>
+        cls="up" if z.chg_pct>=0 else "down"
+        trs.append(f"""
+        <tr>
+          <td class="rank">{rank}</td><td class="code">{z.stock_id}</td><td>{z.stock_name}</td>
+          <td class="price">{z.close:,.2f}</td><td class="{cls}">{z.chg_pct:+.2f}%</td>
+          <td>{z.activity/1e8:.1f}</td><td class="volr">{f2(vr)}</td>
+          <td>{flagtxt}</td><td>{tech:.1f}</td><td>{chip:.1f}</td>
+          <td class="volr">{f2(bias)}%</td>
+          <td>{f1(s1)}</td><td>{f1(s2)}</td><td>{f1(r1)}</td><td>{f1(r2)}</td>
+          <td class="{risk_class(risk)}">{'-' if not finite(risk) else int(risk)}</td>
+          <td class="rr">{f2(rr)}</td><td class="grade">{grade}</td>
+        </tr>
+        """)
+
+    st.markdown("""
+    <div class="table-wrap"><table class="stock-table"><thead><tr>
+      <th>排名</th><th>代號</th><th>名稱</th><th>股價</th><th>漲跌幅</th><th>成交金額(億)</th><th>量比</th>
+      <th>賊大戰術 ①～⑧</th><th>技術分(60%)</th><th>籌碼分(20%)</th><th>乖離率(離季線)</th>
+      <th>支撐1</th><th>支撐2</th><th>壓力1</th><th>壓力2</th><th>風險係數</th><th>風報比</th><th>評等</th>
+    </tr></thead><tbody>
+    """+"".join(trs)+"""
+    </tbody></table></div>
+    """, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="legend-grid">
+      <div class="legend"><h4>賊大戰術 ①～⑧ 說明</h4>
+        <p>① 均線多頭排列（短＞中＞長）</p><p>② 股價站上季線</p><p>③ 成交量放大（大於20日均量）</p><p>④ KD 黃金交叉</p>
+        <p>⑤ RSI ＞ 50</p><p>⑥ MACD 柱狀體 ＞ 0</p><p>⑦ 法人近5日買超</p><p>⑧ 風險係數 ≤ 40</p>
+      </div>
+      <div class="legend"><h4>乖離率（離季線）說明</h4>
+        <p><span class="red">+5%以上：</span>強勢過熱</p><p><span class="orange">+2%～+5%：</span>偏強</p>
+        <p><span class="green">-2%～+2%：</span>合理區間</p><p><span class="orange">-2%～-5%：</span>偏弱</p><p><span class="red">-5%以下：</span>超跌</p>
+      </div>
+      <div class="legend"><h4>風險係數說明（0～100）</h4>
+        <p><span class="green">● 0～30</span>　風險低（安全區）</p><p><span class="orange">● 31～60</span>　風險中（注意區）</p>
+        <p><span class="red">● 61～100</span>　風險高（警戒區）</p><p>評估：乖離、爆量、20MA、斜率、RSI、風報比。</p>
+      </div>
+      <div class="legend"><h4>風報比說明</h4>
+        <p>風報比＝預估上漲空間 ÷ 預估下跌風險</p><p>數值越高，報酬相對風險越好。</p>
+        <p><span class="green">S 90～100</span> 極強</p><p><span class="orange">A+ 80～89</span> 很強</p><p>A 70～79｜A- 60～69｜B 50～59｜C &lt;50</p>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="panel"><div class="panel-title">個股詳細分析</div>', unsafe_allow_html=True)
+    options=[f"{z.stock_id} {z.stock_name}" for z in top.itertuples(index=False)]
+    selected=st.selectbox("選擇股票",options,index=0)
+    code=selected.split()[0]
+    row=top[top["stock_id"]==code].iloc[0]
+
+    if code not in details:
+        try:
+            with st.spinner("補抓這檔完整歷史資料…"):
+                h=hist(code,row["market"])
+                a=analyze(h) if not h.empty else None
+                if a is not None:
+                    details[code]=a
+                    inst[code]=institutional_5d(code)
+                    st.session_state["details"]=details
+                    st.session_state["inst"]=inst
+        except:
+            pass
+
+    if code in details:
+        a=details[code]
+        left,right=st.columns([1.55,1])
+        with left:
+            st.plotly_chart(chart(a["data"],code,row["stock_name"]),use_container_width=True)
+        with right:
+            st.markdown(f"""
+            <div class="detail-box"><h4>技術指標</h4>
+              <p>型態：{a["pattern"]}</p><p>KD：{"黃金交叉" if a["kd_golden"] else "整理"}</p>
+              <p>RSI(14)：{a["rsi"]:.1f}</p><p>量比：{a["vr"]:.2f}x</p>
+              <p>MA5：{slope_label(a["s5"])}</p><p>MA20：{slope_label(a["s20"])}</p><p>MA60：{slope_label(a["s60"])}</p>
             </div>
-            """,
-            unsafe_allow_html=True
-        )
+            <div class="detail-box"><h4>支撐 / 壓力</h4>
+              <p>支撐1：{f2(a["support"])}</p><p>支撐2：{f2(a["support2"])}</p><p>壓力1：{f2(a["resistance"])}</p><p>壓力2：{f2(a["resistance2"])}</p>
+            </div>
+            <div class="detail-box"><h4>乖離 / 風險</h4>
+              <p>離季線：{f2(a["bias60"])}%</p><p>風險係數：{a["risk"]}/100</p><p>風報比：{f2(a["rr"])}</p>
+              <p>法人5日淨額：{inst.get(code,0):,.0f}</p>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("這檔目前無法取得完整歷史 K 線，但 Top 10 排行仍可正常使用。")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if st.button(
-            f"查看 {z.stock_id} {z.stock_name} 詳細走勢",
-            key=f"detail_{z.stock_id}",
-            use_container_width=True
-        ):
-            st.session_state["selected"] = z.stock_id
-
-    code = st.session_state.get("selected")
-    if code:
-        row = top[top["stock_id"] == code]
-        if not row.empty:
-            row = row.iloc[0]
-
-            if code not in details:
-                try:
-                    with st.spinner("補抓這檔歷史K線…"):
-                        h = hist(code, row["market"])
-                        a = analyze(h) if not h.empty else None
-                        if a is not None:
-                            details[code] = a
-                            st.session_state["details"] = details
-                except:
-                    pass
-
-            st.divider()
-            st.markdown(f"## 🔎 {code} {row['stock_name']} 詳細分析")
-
-            if code in details:
-                x = details[code]
-
-                m1,m2,m3,m4 = st.columns(4)
-                m1.metric("賊大分數", x["score"])
-                m2.metric("風險係數", f'{x["risk"]}/100')
-                m3.metric("型態", x["pattern"])
-                m4.metric("風報比", f'{x["rr"]:.2f}' if finite(x["rr"]) else "-")
-
-                st.plotly_chart(chart(x["data"], code, row["stock_name"]), use_container_width=True)
-
-                a1,a2 = st.columns(2)
-                with a1:
-                    st.markdown("### 趨勢 / 斜率")
-                    st.write(f"MA5：{slope_label(x['s5'])}")
-                    st.write(f"MA20：{slope_label(x['s20'])}")
-                    st.write(f"MA60：{slope_label(x['s60'])}")
-                    st.write(f"賊大條件：{x['condition']}")
-                with a2:
-                    st.markdown("### 支撐 / 壓力 / 乖離")
-                    st.write(f"第一支撐：{x['support']:.2f}" if finite(x["support"]) else "第一支撐：-")
-                    st.write(f"第一壓力：{x['resistance']:.2f}" if finite(x["resistance"]) else "第一壓力：-")
-                    if finite(x["bias5"]) and finite(x["bias20"]) and finite(x["bias60"]):
-                        st.write(f"乖離：5MA {x['bias5']:.1f}%｜20MA {x['bias20']:.1f}%｜60MA {x['bias60']:.1f}%")
-                    else:
-                        st.write("乖離：資料不足")
-
-                st.markdown("### 技術指標")
-                st.write(f"RSI：{x['rsi']:.1f}｜KD：{x['k']:.1f}/{x['d']:.1f}｜量比：{x['vr']:.2f}x")
-
-                if x["risk"] <= 30 and x["score"] >= 80:
-                    st.success("劇本：偏強，優先等支撐確認或突破量價確認，避免高乖離追價。")
-                elif x["risk"] >= 60:
-                    st.error("劇本：風險偏高，先等乖離收斂、支撐確認或斜率重新轉強。")
-                else:
-                    st.warning("劇本：觀察區，等量價、支撐與斜率進一步確認。")
-            else:
-                st.info("這檔免費歷史K線目前取不到，但全市場 Top 10 仍可正常使用。")
-
-st.caption("免費穩定版 v2：TWSE/TPEx 官方盤後行情負責全市場排行；免費歷史K線僅做個股加值分析。")
+st.markdown('<div class="note">＊本系統僅提供盤後研究參考，投資請自行評估風險，盈虧自負。</div>', unsafe_allow_html=True)
