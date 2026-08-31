@@ -1393,7 +1393,15 @@ if "snap" in st.session_state:
     fundamentals=st.session_state.get("fundamentals",{})
     shorts=st.session_state.get("shorts",{})
     chips=st.session_state.get("chips",{})
-    top=snap.head(10).copy()
+    _ranked_all = snap.copy()
+    _show_n = st.selectbox(
+        "強勢股顯示數量",
+        [10, 20, 50, "全部"],
+        index=0,
+        key="top_show_n",
+        help="Top 10 只是精選；可切換看 20、50 或全部候選股。"
+    )
+    top = _ranked_all.copy() if _show_n == "全部" else _ranked_all.head(int(_show_n)).copy()
     for _c in ["close","chg_pct","activity","final_score"]:
         if _c in top.columns:
             top[_c] = pd.to_numeric(top[_c], errors="coerce")
@@ -1448,6 +1456,14 @@ if "snap" in st.session_state:
 
     category_rows = {label: [] for label in zeida_labels}
 
+    _zeida_show_n = st.selectbox(
+        "每個賊大條件顯示數量",
+        [5, 10, 20, "全部"],
+        index=1,
+        key="zeida_show_n",
+        help="每個條件可直接看 5、10、20 或全部符合股票。"
+    )
+
     # 直接依目前深度分析結果分桶，不再要求使用者自己選條件
     for z in snap.itertuples(index=False):
         a = details.get(z.stock_id)
@@ -1494,7 +1510,9 @@ if "snap" in st.session_state:
         df_cat = df_cat.sort_values(
             ["綜合分", "風報比", "成交金額(億)"],
             ascending=[False, False, False]
-        ).head(5)
+        )
+        if _zeida_show_n != "全部":
+            df_cat = df_cat.head(int(_zeida_show_n))
 
         st.dataframe(
             df_cat,
@@ -1512,7 +1530,7 @@ if "snap" in st.session_state:
                 "EPS": st.column_config.NumberColumn(format="%.2f"),
             },
         )
-        st.caption(f"符合 {len(rows)} 檔，顯示綜合分最高前 5 檔。")
+        st.caption(f"符合 {len(rows)} 檔，目前顯示 {len(df_cat)} 檔。")
 
     st.markdown(
         '<div style="margin-top:14px;font-size:13px;line-height:1.8;color:#9fb1c2">'
@@ -1565,7 +1583,11 @@ if "snap" in st.session_state:
         st.caption("回測不是未來保證；⑤基本面策略需要完整歷史財報時間對齊，目前只做即時選股，不納入歷史勝率。")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="panel"><div class="panel-title">Top 10 強勢股 <span style="font-size:12px;color:#9fb1c2">（依綜合評分排序）</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="panel"><div class="panel-title">🏆 強勢股排名 '
+        f'<span style="font-size:12px;color:#9fb1c2">（依綜合評分排序｜目前顯示 {len(top)} 檔）</span></div>',
+        unsafe_allow_html=True
+    )
 
     trs=[]
     for rank,z in enumerate(top.itertuples(index=False),1):
