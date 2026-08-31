@@ -272,23 +272,49 @@ def analyze(raw):
             if ok:
                 risk += pts
 
-        cond = "①強勢觀察" if gt(c, ma20) else "整理觀察"
-        if finite(r40) and r40 < 22 and vr >= 1.7 and c >= hi40*.99:
-            cond = "③剛起動"
-        elif finite(r40) and r40 > 25 and finite(from_hi) and -15 < from_hi < -2 and vr < 1.3:
-            cond = "④強勢拉回"
-        elif c >= hi20*.995 and vr >= 1.3:
-            cond = "②盤整突破"
-        elif finite(r40) and r40 > 30 and c >= hi40*.99:
-            cond = "⑥強勢噴出"
-        elif finite(r40) and r40 < 0 and vr >= 1.8 and gt(c, ma20):
-            cond = "⑦跌深轉折"
+        # 賊大 8 大選股分類（資金生命週期）
+        # ⑤需要營收/EPS基本面資料，現階段不硬猜，避免把純技術強勢股誤標成營運成長股。
+        zeida_tags = []
+
+        # ① 強勢熱門小型股：趨勢強、量能活、接近近期高點
+        if gt(ma5, ma10) and gt(ma10, ma20) and gt(c, ma20) and vr >= 1.20 and c >= hi20 * .97:
+            zeida_tags.append("①強勢熱門")
+
+        # ② 盤整待突破：20日區間收斂、靠近區間上緣、量能開始增加
+        range20 = ((hi20 - lo20) / lo20 * 100) if lo20 > 0 else np.nan
+        if finite(range20) and range20 <= 12 and c >= hi20 * .965 and vr >= 1.05:
+            zeida_tags.append("②盤整待突破")
+
+        # ③ 剛起動：過去40日漲幅還不大，今日/近期量能突然放大並逼近高點
+        if finite(r40) and -5 <= r40 < 22 and vr >= 1.60 and c >= hi20 * .985:
+            zeida_tags.append("③剛起動")
+
+        # ④ 強勢股拉回：前波40日已有明顯漲幅，從40日高點回落，但仍守中短均線
+        if finite(r40) and r40 >= 25 and finite(from_hi) and -15 <= from_hi <= -2 and gt(c, ma20) and vr <= 1.50:
+            zeida_tags.append("④強勢股拉回")
+
+        # ⑤ 營運成長潛力：需基本面資料，這版先保留欄位，不用技術面冒充基本面。
+
+        # ⑥ 強勢噴出／軋空中：前波已強、再創近期高，且量能明顯擴大
+        if finite(r40) and r40 >= 30 and c >= hi40 * .99 and vr >= 1.40:
+            zeida_tags.append("⑥強勢噴出")
+
+        # ⑦ 跌深轉折出量：40日仍弱，但重新站上20MA且爆量
+        if finite(r40) and r40 < 0 and gt(c, ma20) and vr >= 1.70 and hist_now >= hist_prev:
+            zeida_tags.append("⑦跌深轉折")
+
+        # ⑧ 整理轉強／軋空前：站上中期均線、20MA走升，但尚未大噴出
+        if gt(c, ma60) and finite(s20) and s20 > 0 and finite(r40) and r40 < 25 and 1.0 <= vr < 1.8:
+            zeida_tags.append("⑧整理轉強")
+
+        cond = zeida_tags[0] if zeida_tags else ("①強勢觀察" if gt(c, ma20) else "整理觀察")
 
         return {
             "score": int(max(0,min(100,round(score-risk*.1)))),
             "risk": min(100,risk),
             "pattern": pattern,
             "condition": cond,
+            "zeida_tags": zeida_tags,
             "bias5": b5, "bias20": b20, "bias60": b60,
             "s5": s5, "s20": s20, "s60": s60,
             "support": support, "support2": support2,
@@ -570,6 +596,110 @@ if "snap" in st.session_state:
     """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ===== 賊大選股：直接把 8 大條件的股票全部選出來 =====
+    st.markdown(
+        '<div class="panel"><div class="panel-title">🥷 賊大選股 '
+        '<span style="font-size:12px;color:#9fb1c2">（直接掃出條件一～八）</span></div>',
+        unsafe_allow_html=True
+    )
+
+    zeida_labels = [
+        "① 強勢熱門小型股",
+        "② 盤整待突破股",
+        "③ 剛起動的中小型股",
+        "④ 強勢股拉回股",
+        "⑤ 營運成長潛力股",
+        "⑥ 強勢噴出股（軋空中）",
+        "⑦ 跌深轉折出量股",
+        "⑧ 整理轉強股（軋空前）",
+    ]
+
+    # 對應 analyze() 內部標籤
+    tag_map = {
+        "① 強勢熱門小型股": "①強勢熱門",
+        "② 盤整待突破股": "②盤整待突破",
+        "③ 剛起動的中小型股": "③剛起動",
+        "④ 強勢股拉回股": "④強勢股拉回",
+        "⑤ 營運成長潛力股": "⑤營運成長潛力",
+        "⑥ 強勢噴出股（軋空中）": "⑥強勢噴出",
+        "⑦ 跌深轉折出量股": "⑦跌深轉折",
+        "⑧ 整理轉強股（軋空前）": "⑧整理轉強",
+    }
+
+    category_rows = {label: [] for label in zeida_labels}
+
+    # 直接依目前深度分析結果分桶，不再要求使用者自己選條件
+    for z in snap.itertuples(index=False):
+        a = details.get(z.stock_id)
+        if not a:
+            continue
+
+        tags = a.get("zeida_tags", [])
+        for label in zeida_labels:
+            target_tag = tag_map[label]
+            if target_tag not in tags:
+                continue
+
+            category_rows[label].append({
+                "代號": str(z.stock_id),
+                "名稱": str(z.stock_name),
+                "股價": float(z.close) if finite(z.close) else np.nan,
+                "漲跌幅%": float(z.chg_pct) if finite(z.chg_pct) else np.nan,
+                "成交金額(億)": float(z.activity)/1e8 if finite(z.activity) else np.nan,
+                "綜合分": float(z.final_score) if finite(z.final_score) else 0.0,
+                "風險": int(a["risk"]) if finite(a.get("risk")) else None,
+                "風報比": round(float(a["rr"]), 2) if finite(a.get("rr")) else None,
+                "型態": a.get("pattern", "-"),
+            })
+
+    # 條件五目前沒有正式營收/EPS資料，避免亂選，直接清楚標示
+    category_rows["⑤ 營運成長潛力股"] = []
+
+    # 每個條件直接顯示最強前 5 檔
+    for label in zeida_labels:
+        rows = category_rows[label]
+
+        st.markdown(
+            f'<div style="margin-top:14px;font-size:18px;font-weight:700">{label}</div>',
+            unsafe_allow_html=True
+        )
+
+        if label == "⑤ 營運成長潛力股":
+            st.info("目前尚未接正式營收 / EPS 基本面資料，所以條件五先不亂選。")
+            continue
+
+        if not rows:
+            st.caption("目前沒有符合條件的股票。")
+            continue
+
+        df_cat = pd.DataFrame(rows)
+        df_cat = df_cat.sort_values(
+            ["綜合分", "風報比", "成交金額(億)"],
+            ascending=[False, False, False]
+        ).head(5)
+
+        st.dataframe(
+            df_cat,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "股價": st.column_config.NumberColumn(format="%.2f"),
+                "漲跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
+                "成交金額(億)": st.column_config.NumberColumn(format="%.1f"),
+                "綜合分": st.column_config.NumberColumn(format="%.1f"),
+                "風報比": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        st.caption(f"符合 {len(rows)} 檔，顯示綜合分最高前 5 檔。")
+
+    st.markdown(
+        '<div style="margin-top:14px;font-size:13px;line-height:1.8;color:#9fb1c2">'
+        '資金生命週期：⑤ → ② → ⑧ → ③ → ① → ④ → ⑥；⑦為跌深反轉另一條路徑。'
+        '</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown('<div class="panel"><div class="panel-title">Top 10 強勢股 <span style="font-size:12px;color:#9fb1c2">（依綜合評分排序）</span></div>', unsafe_allow_html=True)
 
     trs=[]
@@ -625,7 +755,7 @@ if "snap" in st.session_state:
     table_html = (
         '<div class="table-wrap"><table class="stock-table"><thead><tr>'
         '<th>排名</th><th>代號</th><th>名稱</th><th>股價</th><th>漲跌幅</th><th>成交金額(億)</th><th>量比</th>'
-        '<th>賊大戰術 ①～⑧</th><th>技術分(60%)</th><th>籌碼分(20%)</th><th>乖離率(離季線)</th>'
+        '<th>8項技術/籌碼檢核</th><th>技術分(60%)</th><th>籌碼分(20%)</th><th>乖離率(離季線)</th>'
         '<th>支撐1</th><th>支撐2</th><th>壓力1</th><th>壓力2</th><th>風險係數</th><th>風報比</th><th>評等</th>'
         '</tr></thead><tbody>'
         + ''.join(trs) +
@@ -636,7 +766,7 @@ if "snap" in st.session_state:
 
     st.markdown("""
     <div class="legend-grid">
-      <div class="legend"><h4>賊大戰術 ①～⑧ 說明</h4>
+      <div class="legend"><h4>8項技術／籌碼檢核燈號</h4>
         <p>① 均線多頭排列（短＞中＞長）</p><p>② 股價站上季線</p><p>③ 成交量放大（大於20日均量）</p><p>④ KD 黃金交叉</p>
         <p>⑤ RSI ＞ 50</p><p>⑥ MACD 柱狀體 ＞ 0</p><p>⑦ 法人近5日買超</p><p>⑧ 風險係數 ≤ 40</p>
       </div>
