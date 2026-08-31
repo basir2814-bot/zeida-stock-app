@@ -380,6 +380,15 @@ def f1(v, dash="-"):
 def f2(v, dash="-"):
     return dash if not finite(v) else f"{float(v):.2f}"
 
+def money_yi(v):
+    return "-" if not finite(v) else f"{float(v)/1e8:.1f}"
+
+def signed_pct(v):
+    return "-" if not finite(v) else f"{float(v):+.2f}%"
+
+def price2(v):
+    return "-" if not finite(v) else f"{float(v):,.2f}"
+
 st.markdown("""
 <style>
 :root{
@@ -456,11 +465,19 @@ if scan:
     if snap.empty:
         st.error("TWSE/TPEx 官方行情目前沒有取得。")
     else:
-        snap["lots"] = pd.to_numeric(snap["volume"], errors="coerce").fillna(0)/1000
-        snap["activity"] = snap["value"].where(
-            snap["value"].notna()&(snap["value"]>0),
-            snap["volume"]*snap["close"]
-        )
+        for _c in ["close","volume","value","change"]:
+            snap[_c] = pd.to_numeric(snap[_c], errors="coerce")
+        snap["close"] = snap["close"].fillna(0.0)
+        snap["volume"] = snap["volume"].fillna(0.0)
+        snap["value"] = snap["value"].fillna(0.0)
+        snap["change"] = snap["change"].fillna(0.0)
+
+        snap["lots"] = snap["volume"]/1000.0
+        snap["activity"] = np.where(
+            snap["value"] > 0,
+            snap["value"],
+            snap["volume"] * snap["close"]
+        ).astype(float)
         snap["chg_pct"] = (
             pd.to_numeric(snap["change"],errors="coerce").fillna(0) /
             snap["close"].replace(0,np.nan) * 100
@@ -517,7 +534,7 @@ if scan:
                     risk_bonus = max(0,20-a["risk"]*0.20)
                     final = tech+chip+risk_bonus
                 else:
-                    final = float(z.broad_score)*0.72
+                    final = (float(z.broad_score) if finite(z.broad_score) else 0.0)*0.72
                 scored.append(final)
             snap["final_score"]=scored
             snap=snap.sort_values(["final_score","activity"],ascending=False).reset_index(drop=True)
@@ -586,8 +603,8 @@ if "snap" in st.session_state:
         trs.append(f"""
         <tr>
           <td class="rank">{rank}</td><td class="code">{z.stock_id}</td><td>{z.stock_name}</td>
-          <td class="price">{z.close:,.2f}</td><td class="{cls}">{z.chg_pct:+.2f}%</td>
-          <td>{z.activity/1e8:.1f}</td><td class="volr">{f2(vr)}</td>
+          <td class="price">{price2(z.close)}</td><td class="{cls}">{signed_pct(z.chg_pct)}</td>
+          <td>{money_yi(z.activity)}</td><td class="volr">{f2(vr)}</td>
           <td>{flagtxt}</td><td>{tech:.1f}</td><td>{chip:.1f}</td>
           <td class="volr">{f2(bias)}%</td>
           <td>{f1(s1)}</td><td>{f1(s2)}</td><td>{f1(r1)}</td><td>{f1(r2)}</td>
