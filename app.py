@@ -447,13 +447,13 @@ st.markdown("""
 
 # Scan filters - shaped like the mockup.
 st.markdown('<div class="panel"><div class="filter-head">初篩條件 <span style="font-size:12px;color:#9fb1c2">（可調整）</span></div></div>', unsafe_allow_html=True)
-f1,f2,f3,f4,f5,f6 = st.columns(6)
-min_money = f1.selectbox("成交金額", [0.5,1.0,2.0,5.0], index=1, format_func=lambda x:f"≥ {x:g} 億")
-min_price = f2.selectbox("股價", [5.0,10.0,20.0,50.0], index=0, format_func=lambda x:f"≥ {x:g} 元")
-min_day = f3.selectbox("日漲跌幅", [0.0,1.0,2.0,3.0], index=1, format_func=lambda x:f"≥ {x:g}%")
-min_month = f4.selectbox("月漲跌幅", [0.0,3.0,5.0,10.0], index=2, format_func=lambda x:f"≥ {x:g}%")
-season_rule = f5.selectbox("季線位置", ["不限","站上季線"], index=1)
-kd_rule = f6.selectbox("KD 指標", ["不限","KD 黃金交叉"], index=1)
+col_money,col_price,col_day,col_month,col_season,col_kd = st.columns(6)
+min_money = col_money.selectbox("成交金額", [0.5,1.0,2.0,5.0], index=1, format_func=lambda x:f"≥ {x:g} 億")
+min_price = col_price.selectbox("股價", [5.0,10.0,20.0,50.0], index=0, format_func=lambda x:f"≥ {x:g} 元")
+min_day = col_day.selectbox("日漲跌幅", [0.0,1.0,2.0,3.0], index=1, format_func=lambda x:f"≥ {x:g}%")
+min_month = col_month.selectbox("月漲跌幅", [0.0,3.0,5.0,10.0], index=2, format_func=lambda x:f"≥ {x:g}%")
+season_rule = col_season.selectbox("季線位置", ["不限","站上季線"], index=1)
+kd_rule = col_kd.selectbox("KD 指標", ["不限","KD 黃金交叉"], index=1)
 
 scan = st.button("🔍 執行全市場掃描", type="primary", use_container_width=True)
 
