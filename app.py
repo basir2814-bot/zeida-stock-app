@@ -10,7 +10,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-08-31-v7-cond2-cond3-balanced"
+APP_LOGIC_VERSION = "2026-08-31-v8-show-all-fix"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -1710,12 +1710,15 @@ if "snap" in st.session_state:
     _ranked_all = snap.copy()
     _show_n = st.selectbox(
         "強勢股顯示數量",
-        [10, 20, 50, "全部"],
+        ["10 檔", "20 檔", "50 檔", "全部候選股"],
         index=0,
         key="top_show_n",
-        help="Top 10 只是精選；可切換看 20、50 或全部候選股。"
+        help="選『全部候選股』會顯示目前通過初篩的全部候選，不只 Top 10。"
     )
-    top = _ranked_all.copy() if _show_n == "全部" else _ranked_all.head(int(_show_n)).copy()
+    if _show_n == "全部候選股":
+        top = _ranked_all.copy()
+    else:
+        top = _ranked_all.head(int(_show_n.split()[0])).copy()
     for _c in ["close","chg_pct","activity","final_score"]:
         if _c in top.columns:
             top[_c] = pd.to_numeric(top[_c], errors="coerce")
@@ -1726,6 +1729,9 @@ if "snap" in st.session_state:
     full=len(details)
     strong=sum(1 for k,v in details.items() if finite(v.get("score")) and float(v.get("score"))>=80)
 
+    if _show_n == "全部候選股":
+        st.success(f"已切換為全部候選股：共 {len(top)} 檔。往下的『完整候選股清單』會全部列出。")
+
     st.markdown('<div class="panel"><div class="panel-title">市場總覽</div>', unsafe_allow_html=True)
     st.markdown(f"""
     <div class="overview">
@@ -1733,7 +1739,7 @@ if "snap" in st.session_state:
       <div class="ov green"><div class="t">符合初篩檔數</div><div class="v">{qualified}</div><div class="s">{qualified/max(total,1)*100:.1f}%</div></div>
       <div class="ov orange"><div class="t">進入賊大①～⑧檔數</div><div class="v">{full}</div><div class="s">{full/max(total,1)*100:.1f}%</div></div>
       <div class="ov orange"><div class="t">強勢候選檔數</div><div class="v">{strong}</div><div class="s">深度分析80分以上</div></div>
-      <div class="ov red"><div class="t">🔥 Top 10 推薦</div><div class="v">{len(top)}</div><div class="s">🏆 今日精選</div></div>
+      <div class="ov red"><div class="t">🔥 Top 10 推薦</div><div class="v">{min(10,len(_ranked_all))}</div><div class="s">🏆 今日精選</div></div>
     </div>
     """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1773,10 +1779,10 @@ if "snap" in st.session_state:
 
     _zeida_show_n = st.selectbox(
         "每個賊大條件顯示數量",
-        [5, 10, 20, "全部"],
+        ["5 檔", "10 檔", "20 檔", "全部符合"],
         index=1,
         key="zeida_show_n",
-        help="每個條件可直接看 5、10、20 或全部符合股票。"
+        help="選『全部符合』會把該賊大條件目前符合的股票全部列出。"
     )
 
     # 直接依目前深度分析結果分桶，不再要求使用者自己選條件
@@ -1832,8 +1838,8 @@ if "snap" in st.session_state:
             ["綜合分", "風報比", "成交金額(億)"],
             ascending=[False, False, False]
         )
-        if _zeida_show_n != "全部":
-            df_cat = df_cat.head(int(_zeida_show_n))
+        if _zeida_show_n != "全部符合":
+            df_cat = df_cat.head(int(_zeida_show_n.split()[0]))
 
         st.dataframe(
             df_cat,
@@ -1945,6 +1951,28 @@ if "snap" in st.session_state:
             )
         st.caption("回測不是未來保證；⑤基本面策略需要完整歷史財報時間對齊，目前只做即時選股，不納入歷史勝率。")
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+    if _show_n == "全部候選股":
+        st.markdown('<div class="panel"><div class="panel-title">📋 完整候選股清單</div>', unsafe_allow_html=True)
+        _all_view = top[["stock_id","stock_name","close","chg_pct","activity","final_score"]].copy()
+        _all_view.columns = ["代號","名稱","股價","漲跌幅%","成交金額","綜合分"]
+        _all_view["成交金額(億)"] = pd.to_numeric(_all_view["成交金額"], errors="coerce") / 1e8
+        _all_view = _all_view.drop(columns=["成交金額"])
+        st.dataframe(
+            _all_view,
+            use_container_width=True,
+            hide_index=True,
+            height=min(1200, 80 + len(_all_view)*35),
+            column_config={
+                "股價": st.column_config.NumberColumn(format="%.2f"),
+                "漲跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
+                "成交金額(億)": st.column_config.NumberColumn(format="%.1f"),
+                "綜合分": st.column_config.NumberColumn(format="%.1f"),
+            }
+        )
+        st.caption(f"完整候選股共 {len(_all_view)} 檔，這張表不會只截前 10 / 20 / 50 檔。")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(
         f'<div class="panel"><div class="panel-title">🏆 強勢股排名 '
