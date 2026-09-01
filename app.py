@@ -1,4 +1,5 @@
 import re, time
+from html.parser import HTMLParser
 import numpy as np
 import pandas as pd
 import requests
@@ -10,7 +11,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-09-01-v15-multipool-scan"
+APP_LOGIC_VERSION = "2026-09-02-v16-tpex-html-fallback"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -418,6 +419,95 @@ def lt(a, b):
     return finite(a) and finite(b) and float(a) < float(b)
 
 @st.cache_data(ttl=900, show_spinner=False)
+
+class _SimpleTableParser(HTMLParser):
+    """只用 Python 標準庫解析 TPEx HTML 表格，避免新增 bs4/lxml 依賴。"""
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self._row = None
+        self._cell = None
+        self._in_td = False
+        self._in_th = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+            self._in_td = tag == "td"
+            self._in_th = tag == "th"
+
+    def handle_data(self, data):
+        if self._cell is not None and (self._in_td or self._in_th):
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("td", "th") and self._cell is not None and self._row is not None:
+            txt = "".join(self._cell).replace("\xa0", " ").strip()
+            self._row.append(txt)
+            self._cell = None
+            self._in_td = False
+            self._in_th = False
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+
+
+def fetch_tpex_html_fallback():
+    """
+    TPEx OpenAPI 若 HTTPError，改抓櫃買中心公開的「上櫃股票行情」HTML。
+    欄位：代號、名稱、收盤、漲跌、開盤、最高、最低、均價、成交股數、成交金額...
+    """
+    urls = [
+        "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=htm",
+        "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?d=&l=zh-tw&o=htm",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEAD, timeout=30)
+            r.raise_for_status()
+            if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
+                try:
+                    r.encoding = r.apparent_encoding or "utf-8"
+                except Exception:
+                    r.encoding = "utf-8"
+
+            parser = _SimpleTableParser()
+            parser.feed(r.text)
+
+            out = []
+            for cells in parser.rows:
+                if len(cells) < 10:
+                    continue
+
+                code = str(cells[0]).strip()
+                if not re.fullmatch(r"\d{4}", code):
+                    continue
+
+                name = str(cells[1]).strip()
+                close = to_num(cells[2])
+                chg = to_num(cells[3])
+                opn = to_num(cells[4])
+                high = to_num(cells[5])
+                low = to_num(cells[6])
+                vol = to_num(cells[8])
+                val = to_num(cells[9])
+
+                if finite(close):
+                    out.append([code, name, "上櫃", close, opn, high, low, vol, val, chg])
+
+            if len(out) >= 300:
+                return out, "TPEx公開行情HTML"
+        except Exception:
+            continue
+
+    return [], None
+
+
 def snapshot():
     rows, warnings = [], []
 
@@ -482,11 +572,23 @@ def snapshot():
             continue
 
     if not tpex_ok:
-        warnings.append("上櫃資料暫時無法取得（TPEx 主來源與備援皆失敗）")
+        # 第三層備援：TPEx 公開「上櫃股票行情」HTML。
+        # 這個來源與 OpenAPI 是不同路徑，OpenAPI HTTPError 時仍有機會正常取得。
+        try:
+            _html_rows, _html_source = fetch_tpex_html_fallback()
+            if _html_rows:
+                rows.extend(_html_rows)
+                tpex_ok = True
+                warnings.append(f"上櫃 OpenAPI 暫時失敗，已自動改用 {_html_source}。")
+        except Exception:
+            pass
+
+    if not tpex_ok:
+        warnings.append("上櫃資料暫時無法取得（OpenAPI 與公開行情備援皆失敗）")
 
     d = pd.DataFrame(rows, columns=["stock_id","stock_name","market","close","open_today","high_today","low_today","volume","value","change"])
     if not d.empty:
-        d = d.drop_duplicates("stock_id")
+        d = d.drop_duplicates("stock_id", keep="last")
         d = d[~d.stock_name.astype(str).str.contains("ETF|ETN|權證|指數|債", case=False, na=False)]
     return d, warnings
 
