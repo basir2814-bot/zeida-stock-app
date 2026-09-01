@@ -10,7 +10,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-09-01-v12-confidence-filter"
+APP_LOGIC_VERSION = "2026-09-01-v14-data-quality-dashboard"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -1319,6 +1319,65 @@ def data_quality_score(a, fund, sh, cp, cap):
     }
 
 
+
+def data_quality_breakdown(a, fund, sh, cp, cap):
+    """分項資料品質：未取得不視為0，而是降低品質分數。"""
+    result = {}
+
+    k_ok = bool(a and a.get("data") is not None and len(a.get("data")) >= 120)
+    result["K線"] = {
+        "score":100 if k_ok else 40 if a and a.get("data") is not None else 0,
+        "status":"✅" if k_ok else "⚠️" if a and a.get("data") is not None else "❌",
+        "detail":"歷史K線足夠" if k_ok else "歷史K線不足"
+    }
+
+    cp_ok = bool(cp.get("available", False))
+    cp_days = int(cp.get("positive_days5",0) or 0)
+    result["法人"] = {
+        "score":100 if cp_ok else 0,
+        "status":"✅" if cp_ok else "❌",
+        "detail":f"近5日正向 {cp_days} 天" if cp_ok else "法人資料未取得"
+    }
+
+    short_ok = finite(sh.get("balance")) or finite(sh.get("change5"))
+    result["融券"] = {
+        "score":100 if short_ok else 0,
+        "status":"✅" if short_ok else "❌",
+        "detail":f"5日變化 {sh.get('change5'):.0f}" if finite(sh.get("change5")) else "融券資料未取得"
+    }
+
+    rev_ok = finite(fund.get("revenue_yoy"))
+    result["營收"] = {
+        "score":100 if rev_ok else 0,
+        "status":"✅" if rev_ok else "❌",
+        "detail":f"YoY {fund.get('revenue_yoy'):.1f}%" if rev_ok else "營收資料未取得"
+    }
+
+    eps_ok = finite(fund.get("eps"))
+    result["EPS"] = {
+        "score":100 if eps_ok else 0,
+        "status":"✅" if eps_ok else "❌",
+        "detail":f"EPS {fund.get('eps'):.2f}" if eps_ok else "EPS資料未取得"
+    }
+
+    cap_ok = finite(cap.get("capital"))
+    result["股本"] = {
+        "score":100 if cap_ok else 0,
+        "status":"✅" if cap_ok else "❌",
+        "detail":f"{cap.get('capital')/1e8:.1f} 億" if cap_ok else "股本資料未取得"
+    }
+
+    weights = {"K線":30,"法人":20,"融券":15,"營收":15,"EPS":10,"股本":10}
+    overall = int(round(sum(result[k]["score"]*weights[k]/100 for k in weights)))
+    result["整體"] = {
+        "score":overall,
+        "status":"✅" if overall>=85 else "⚠️" if overall>=65 else "❌",
+        "detail":"高品質" if overall>=85 else "中等" if overall>=65 else "偏低"
+    }
+    return result
+
+
+
 def strategy_market_adjust(stage, market_score):
     """
     不同戰術對市場環境敏感度不同。
@@ -1476,37 +1535,54 @@ def evaluate_zeida_full(a, fund, sh, cp, cap, close, day_chg=np.nan):
     finish("②盤整待突破", sc, why, missing=(0 if chip_available else 1),
            hard_fail=not (base and near_break))
 
-    # ③ 剛起動：第一波攻擊
+    # ③ 剛起動：核心型態優先，法人/股本只加分，不作硬門檻
     why=[]; sc=0
     little_prior = finite(prior20) and prior20 < 12 and finite(r40) and r40 < 22
     first_wave = big_up5 <= 1
-    sudden_vol = finite(vr) and vr >= 1.35
-    first_attack = c >= hi20*.97 and (not finite(day_chg) or day_chg>=1.5)
-    sc += _score_bool(little_prior,30); sc += _score_bool(first_wave,20)
-    sc += _score_bool(sudden_vol,25); sc += _score_bool(first_attack,20)
-    sc += _score_bool(inst5>=0,5)
+    sudden_vol = finite(vr) and vr >= 1.25
+    first_attack = c >= hi20*.965 and (not finite(day_chg) or day_chg>=1.0)
+    core3 = little_prior and first_wave and sudden_vol and first_attack
+
+    sc += _score_bool(little_prior,30)
+    sc += _score_bool(first_wave,20)
+    sc += _score_bool(sudden_vol,25)
+    sc += _score_bool(first_attack,20)
+    sc += _score_bool(inst5>=0,3)
+    sc += _score_bool(small_cap is True,2)
+
     if little_prior: why.append("前面漲幅不大")
     if sudden_vol: why.append("突然放量")
     if first_wave: why.append("近5日未連續噴出")
     if first_attack: why.append("第一波攻擊")
-    finish("③剛起動", sc, why, missing=(0 if chip_available else 1),
-           hard_fail=not (little_prior and first_wave and sudden_vol and first_attack))
+    if inst5>0: why.append("法人偏多")
+    if small_cap is True: why.append("股本偏小")
 
-    # ④ 強勢股拉回：主升段回檔 / 洗盤
+    finish("③剛起動", sc, why, missing=0, hard_fail=not core3)
+
+    # ④ 強勢股拉回：核心型態優先；法人續買、量縮是加分，不作硬門檻
     why=[]; sc=0
-    prior_surge = finite(r40) and r40 >= 30
-    pullback = finite(from_hi40) and -16 <= from_hi40 <= -2
-    ma5_wash = recent_below5 or reclaimed5 or (finite(b5) and -4<=b5<=4)
-    sc += _score_bool(prior_surge,30); sc += _score_bool(pullback,20)
-    sc += _score_bool(ma5_wash,20); sc += _score_bool(volume_contract,10)
-    sc += _score_bool(inst_continue,20)
-    if prior_surge: why.append("前40日已大漲")
-    if ma5_wash: why.append("有跌破/測試5MA洗盤")
+    prior_surge = finite(r40) and r40 >= 25
+    pullback = finite(from_hi40) and -18 <= from_hi40 <= -3
+    trend_alive = c > ma20 and (not finite(b60) or b60 > -5)
+    ma5_wash = recent_below5 or reclaimed5 or (finite(b5) and -5<=b5<=5)
+    core4 = prior_surge and pullback and trend_alive and ma5_wash
+
+    sc += _score_bool(prior_surge,30)
+    sc += _score_bool(pullback,20)
+    sc += _score_bool(trend_alive,20)
+    sc += _score_bool(ma5_wash,15)
+    sc += _score_bool(volume_contract,5)
+    sc += _score_bool(inst_continue,10)
+
+    if prior_surge: why.append("前40日已明顯上漲")
+    if pullback: why.append("由波段高點拉回")
+    if trend_alive: why.append("主要趨勢未破")
+    if ma5_wash: why.append("有測試/跌破5MA洗盤")
     if reclaimed5: why.append("重新站回5MA")
     if volume_contract: why.append("回檔量縮")
     if inst_continue: why.append("法人續買")
-    finish("④強勢股拉回", sc, why, missing=(0 if chip_available else 1),
-           hard_fail=not (prior_surge and pullback and ma5_wash))
+
+    finish("④強勢股拉回", sc, why, missing=0, hard_fail=not core4)
 
     # ⑤ 營運成長潛力：基本面布局
     why=[]; sc=0
@@ -1571,9 +1647,16 @@ def evaluate_zeida_full(a, fund, sh, cp, cap, close, day_chg=np.nan):
            missing=(0 if finite(short_change5) else 1)+(0 if chip_available else 1),
            hard_fail=not (above_mid and trend_not_extended and base2))
 
-    # 成立：分數>=70 且不是低可信度。⑤可獨立存在，其餘主階段只選一個。
+    # 成立：一般策略分數>=70且可信度至少中；
+    # ③/④因核心型態可直接從K線確認，只要核心成立且分數>=65就保留，不因法人資料缺失消失。
     technical_order = ["⑥強勢噴出","④強勢股拉回","③剛起動","⑦跌深轉折","①強勢熱門","⑧整理轉強","②盤整待突破"]
-    eligible = [k for k,v in scores.items() if v>=70 and conf.get(k)!="低"]
+    eligible = []
+    for k,v in scores.items():
+        if k in ["③剛起動","④強勢股拉回"]:
+            if v >= 65:
+                eligible.append(k)
+        elif v >= 70 and conf.get(k)!="低":
+            eligible.append(k)
     primary = next((k for k in technical_order if k in eligible), None)
 
     # 若沒有正式成立，保留最高分作「接近」資訊，但不硬塞分類。
@@ -1660,8 +1743,8 @@ def _backtest_signals(d):
     sig["③剛起動"] = (
         (x["prior20"]<12) & (x["r40"]<22)
         & (x["bigup5"]<=1)
-        & (x["vr"]>=1.35) & (x["close"]>=x["hi20"]*.97)
-        & (x["daychg"]>=1.5)
+        & (x["vr"]>=1.25) & (x["close"]>=x["hi20"]*.965)
+        & (x["daychg"]>=1.0)
     )
     sig["①強勢熱門"] = (
         (x["ma5"]>x["ma10"])&(x["ma10"]>x["ma20"])&(x["close"]>x["ma20"])
@@ -1669,9 +1752,9 @@ def _backtest_signals(d):
         & (x["vr"]>=1.15) & (x["close"]>=x["hi20"]*.95)
     )
     sig["④強勢股拉回"] = (
-        (x["r40"]>=28) & x["from_hi40"].between(-16,-2)
-        & (x["close"]>x["ma20"]) & (x["vr"]<=1.55)
-        & (prev_below5 | (x["bias20"].abs()<=4))
+        (x["r40"]>=25) & x["from_hi40"].between(-18,-3)
+        & (x["close"]>x["ma20"])
+        & (prev_below5 | ((x["close"]/x["ma5"]-1)*100).between(-5,5))
     )
     sig["⑥強勢噴出"] = (
         (x["r40"]>=25) & (x["close"]>=x["hi40"]*.98)
@@ -2101,8 +2184,10 @@ if scan:
                         quality = data_quality_score(a, fund, sh, cp, cap)
                         final_conf = final_strategy_confidence(a, full_eval, quality, market_regime)
 
-                        # 最終可信度低於70，不列為正式賊大主階段，只放接近候選，避免硬分類。
-                        if final_conf["score"] < 70:
+                        # 最終可信度低於70：一般策略不硬分類。
+                        # 但③剛起動、④強勢股拉回的核心型態可由K線直接確認，
+                        # 所以保留分類，只把可信度標成低/中，不因法人或基本面缺資料整檔消失。
+                        if final_conf["score"] < 70 and full_eval.get("primary") not in ["③剛起動","④強勢股拉回"]:
                             full_eval["primary"] = None
                             full_eval["tags"] = [
                                 t for t in full_eval.get("tags",[])
@@ -2117,6 +2202,7 @@ if scan:
                         a["strategy_confidence"] = full_eval.get("confidence", {})
                         a["strategy_near"] = full_eval.get("near", [])
                         a["data_quality"] = quality
+                        a["data_quality_breakdown"] = data_quality_breakdown(a, fund, sh, cp, cap)
                         a["market_regime"] = market_regime
                         a["final_confidence"] = final_conf
                         a["short_ratio"] = full_eval.get("short_ratio", np.nan)
@@ -2429,8 +2515,8 @@ if "snap" in st.session_state:
         '<div class="legend"><h4>①～④ 技術主升路徑</h4><p>'
         '①：股價走強＋量能活躍＋股本偏小＋法人流入。<br>'
         '②：長期橫盤＋近期量能放大＋接近平台突破＋法人不轉空。<br>'
-        '③：前段漲幅不大＋突然放量＋第一波攻擊，排除已連續大漲。<br>'
-        '④：前40日已大漲＋5MA洗盤/重站＋量縮＋法人續買。'
+        '③：核心型態＝前段漲幅不大＋突然放量＋第一波攻擊；法人/股本只加分。<br>'
+        '④：核心型態＝前40日已明顯上漲＋由高點拉回＋5MA洗盤且主趨勢未破；量縮/法人續買只加分。'
         '</p></div>'
         '<div class="legend"><h4>⑤～⑧ 資金/籌碼路徑</h4><p>'
         '⑤：營收/EPS成長＋法人布局＋估值未明顯過熱。<br>'
@@ -2460,6 +2546,54 @@ if "snap" in st.session_state:
 
 
 
+
+    # ===== 資料品質儀表板 =====
+    st.markdown('<div class="panel"><div class="panel-title">🧩 資料品質儀表板</div>', unsafe_allow_html=True)
+
+    _quality_rows = []
+    _name_map = {str(r.stock_id): str(r.stock_name) for r in snap.itertuples(index=False)}
+    for _sid, _a in details.items():
+        _q = _a.get("data_quality_breakdown", {})
+        if not _q:
+            continue
+        _quality_rows.append({
+            "代號": str(_sid),
+            "名稱": _name_map.get(str(_sid), str(_sid)),
+            "K線": _q.get("K線",{}).get("score",0),
+            "法人": _q.get("法人",{}).get("score",0),
+            "融券": _q.get("融券",{}).get("score",0),
+            "營收": _q.get("營收",{}).get("score",0),
+            "EPS": _q.get("EPS",{}).get("score",0),
+            "股本": _q.get("股本",{}).get("score",0),
+            "整體資料品質": _q.get("整體",{}).get("score",0),
+        })
+
+    if _quality_rows:
+        _qdf = pd.DataFrame(_quality_rows)
+        _avgq = {col: float(_qdf[col].mean()) for col in ["K線","法人","融券","營收","EPS","股本","整體資料品質"]}
+
+        st.markdown(
+            f'<div class="summary-grid" style="grid-template-columns:repeat(4,1fr)">'
+            f'<div class="summary-card blue"><div class="label">K線品質</div><div class="big">{_avgq["K線"]:.0f}</div><div class="small">歷史價格 / 成交量</div></div>'
+            f'<div class="summary-card green"><div class="label">法人品質</div><div class="big">{_avgq["法人"]:.0f}</div><div class="small">外資 / 投信 / 自營</div></div>'
+            f'<div class="summary-card orange"><div class="label">融券品質</div><div class="big">{_avgq["融券"]:.0f}</div><div class="small">餘額 / 5日變化</div></div>'
+            f'<div class="summary-card red"><div class="label">整體資料品質</div><div class="big">{_avgq["整體資料品質"]:.0f}</div><div class="small">85以上較理想</div></div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        st.dataframe(
+            _qdf.sort_values("整體資料品質", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            height=min(800, 80 + len(_qdf)*35)
+        )
+        st.caption("未取得資料不會當成0買超或0融券，而是直接降低資料品質分數。")
+    else:
+        st.info("目前還沒有足夠深度分析資料可計算資料品質。")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
     # ===== 高可信度精選 =====
     _hc_rows = []
     for z in snap.itertuples(index=False):
@@ -2467,7 +2601,11 @@ if "snap" in st.session_state:
         if not a:
             continue
         fc = a.get("final_confidence",{})
-        if a.get("primary_stage") and fc.get("score",0) >= 82:
+        if (
+            a.get("primary_stage")
+            and fc.get("score",0) >= 82
+            and a.get("data_quality",{}).get("score",0) >= 75
+        ):
             _hc_rows.append({
                 "代號":str(z.stock_id),
                 "名稱":str(z.stock_name),
@@ -2485,7 +2623,7 @@ if "snap" in st.session_state:
     if _hc_rows:
         _hc = pd.DataFrame(_hc_rows).sort_values(["可信度","戰術分","風報比"],ascending=False).head(10)
         st.dataframe(_hc,use_container_width=True,hide_index=True)
-        st.caption("只列最終可信度 ≥82 的股票；沒有達標就寧可少選。")
+        st.caption("只列最終可信度 ≥82 且資料品質 ≥75 的股票；沒有達標就寧可少選。")
     else:
         st.info("目前沒有最終可信度 ≥82 的股票。寧可不硬選。")
     st.markdown("</div>", unsafe_allow_html=True)
