@@ -10,7 +10,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-09-01-v11-full-zeida-spec"
+APP_LOGIC_VERSION = "2026-09-01-v12-confidence-filter"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -1263,6 +1263,105 @@ def _score_bool(ok, pts):
     return pts if bool(ok) else 0
 
 
+
+def market_regime_score(index_df):
+    """
+    用大盤 20/60MA、20日漲幅、20日波動判定市場環境。
+    只做多方選股風險調整，不把大盤當成絕對買賣訊號。
+    """
+    out = {"score":50, "label":"中性", "detail":"大盤資料不足"}
+    if index_df is None or index_df.empty or len(index_df) < 65:
+        return out
+    d = index_df.copy()
+    d["ma20"] = d["close"].rolling(20).mean()
+    d["ma60"] = d["close"].rolling(60).mean()
+    c = float(d["close"].iloc[-1])
+    ma20 = float(d["ma20"].iloc[-1])
+    ma60 = float(d["ma60"].iloc[-1])
+    r20 = (c/float(d["close"].iloc[-21])-1)*100
+    vol20 = float(d["close"].pct_change().tail(20).std()*100)
+
+    score = 50
+    score += 15 if c > ma20 else -15
+    score += 15 if c > ma60 else -15
+    score += 10 if ma20 > ma60 else -10
+    score += 10 if r20 > 3 else -10 if r20 < -3 else 0
+    score += 5 if vol20 < 2.2 else -5 if vol20 > 3.5 else 0
+    score = int(max(0,min(100,score)))
+
+    label = "多頭" if score >= 70 else "偏多" if score >= 58 else "中性" if score >= 42 else "偏空" if score >= 30 else "空頭"
+    return {
+        "score":score, "label":label,
+        "detail":f"20MA/60MA與20日報酬綜合；20日波動 {vol20:.2f}%"
+    }
+
+
+def data_quality_score(a, fund, sh, cp, cap):
+    """
+    0~100 資料品質分數。
+    缺法人、融券、基本面、股本時，降低策略可信度，避免『缺資料卻高分』。
+    """
+    checks = {
+        "K線": bool(a and a.get("data") is not None and len(a.get("data")) >= 120),
+        "法人": bool(cp.get("available", False)),
+        "融券": finite(sh.get("balance")) or finite(sh.get("change5")),
+        "營收": finite(fund.get("revenue_yoy")),
+        "EPS": finite(fund.get("eps")),
+        "股本": finite(cap.get("capital")),
+    }
+    weights = {"K線":30,"法人":20,"融券":15,"營收":15,"EPS":10,"股本":10}
+    score = sum(weights[k] for k,v in checks.items() if v)
+    missing = [k for k,v in checks.items() if not v]
+    return {
+        "score":int(score),
+        "missing":missing,
+        "label":"高" if score>=85 else "中" if score>=65 else "低"
+    }
+
+
+def strategy_market_adjust(stage, market_score):
+    """
+    不同戰術對市場環境敏感度不同。
+    ①③⑥偏追趨勢，空頭環境扣分較大；④⑦較能容忍震盪；⑤較中性。
+    """
+    if not stage:
+        return 0
+    ms = float(market_score)
+    if stage in ["①強勢熱門","③剛起動","⑥強勢噴出"]:
+        return round((ms-50)*0.22,1)
+    if stage in ["②盤整待突破","⑧整理轉強"]:
+        return round((ms-50)*0.15,1)
+    if stage in ["④強勢股拉回"]:
+        return round((ms-50)*0.10,1)
+    if stage in ["⑦跌深轉折"]:
+        return round((50-ms)*0.05,1)
+    return round((ms-50)*0.05,1)
+
+
+def final_strategy_confidence(a, full_eval, quality, market):
+    """
+    最終可信度：戰術本身分數 + 資料品質 + 市場環境調整。
+    不是『未來上漲機率』，是『目前分類可信程度』。
+    """
+    stage = full_eval.get("primary")
+    if not stage:
+        return {"score":0,"label":"低","reason":"沒有正式成立的主階段"}
+
+    base = float(full_eval.get("scores",{}).get(stage,0))
+    q = float(quality.get("score",0))
+    adj = strategy_market_adjust(stage, market.get("score",50))
+    score = base*0.65 + q*0.25 + max(0,min(100,market.get("score",50)))*0.10 + adj
+    score = int(max(0,min(100,round(score))))
+
+    label = "高" if score>=82 else "中" if score>=70 else "低"
+    miss = "、".join(quality.get("missing",[])) if quality.get("missing") else "無"
+    return {
+        "score":score,
+        "label":label,
+        "reason":f"戰術{base:.0f} / 資料品質{q:.0f} / 大盤{market.get('label','中性')}；缺資料：{miss}"
+    }
+
+
 def evaluate_zeida_full(a, fund, sh, cp, cap, close, day_chg=np.nan):
     """
     依使用者提供的「賊大戰術條件一～八」圖片做完整評估。
@@ -1971,7 +2070,12 @@ if scan:
             ).clip(0,100)
             snap = snap.sort_values(["broad_score","activity"],ascending=False).reset_index(drop=True)
 
-            target = snap.head(min(60,len(snap)))
+            # 大盤環境只抓一次，所有股票共用
+            _market_df = taiex_history()
+            market_regime = market_regime_score(_market_df)
+
+            target = snap.head(min(80,len(snap)))
+
             details, inst, fundamentals, shorts, chips = {}, {}, {}, {}, {}
             bar = st.progress(0,text="進行賊大①～⑧與技術分析…")
             for i,z in enumerate(target.itertuples(index=False)):
@@ -1994,6 +2098,17 @@ if scan:
                             day_chg=z.chg_pct if finite(z.chg_pct) else np.nan
                         )
 
+                        quality = data_quality_score(a, fund, sh, cp, cap)
+                        final_conf = final_strategy_confidence(a, full_eval, quality, market_regime)
+
+                        # 最終可信度低於70，不列為正式賊大主階段，只放接近候選，避免硬分類。
+                        if final_conf["score"] < 70:
+                            full_eval["primary"] = None
+                            full_eval["tags"] = [
+                                t for t in full_eval.get("tags",[])
+                                if t == "⑤營運成長潛力" and full_eval.get("scores",{}).get(t,0) >= 75
+                            ]
+
                         # 完整規格結果覆蓋舊的純技術分類；資料不足時寧可降低可信度，不硬判。
                         a["zeida_tags"] = list(full_eval.get("tags", []))
                         a["primary_stage"] = full_eval.get("primary")
@@ -2001,6 +2116,9 @@ if scan:
                         a["strategy_reasons"] = full_eval.get("reasons", {})
                         a["strategy_confidence"] = full_eval.get("confidence", {})
                         a["strategy_near"] = full_eval.get("near", [])
+                        a["data_quality"] = quality
+                        a["market_regime"] = market_regime
+                        a["final_confidence"] = final_conf
                         a["short_ratio"] = full_eval.get("short_ratio", np.nan)
                         a["pe_est"] = full_eval.get("pe_est", np.nan)
                         a["capital"] = full_eval.get("capital", np.nan)
@@ -2214,6 +2332,9 @@ if "snap" in st.session_state:
                 "股本(億)": round(float(a.get("capital",np.nan))/1e8,1) if finite(a.get("capital")) else np.nan,
                 "法人5日": round(float(a.get("foreign5",0.0)+a.get("trust5",0.0)),0),
                 "融券5日變化": round(float(a.get("short_change5",np.nan)),0) if finite(a.get("short_change5")) else np.nan,
+                "最終可信度": int(a.get("final_confidence",{}).get("score",0) or 0),
+                "資料品質": int(a.get("data_quality",{}).get("score",0) or 0),
+                "大盤": a.get("market_regime",{}).get("label","中性"),
             })
 
 
@@ -2337,6 +2458,37 @@ if "snap" in st.session_state:
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
+
+
+    # ===== 高可信度精選 =====
+    _hc_rows = []
+    for z in snap.itertuples(index=False):
+        a = details.get(z.stock_id)
+        if not a:
+            continue
+        fc = a.get("final_confidence",{})
+        if a.get("primary_stage") and fc.get("score",0) >= 82:
+            _hc_rows.append({
+                "代號":str(z.stock_id),
+                "名稱":str(z.stock_name),
+                "主階段":a.get("primary_stage"),
+                "可信度":int(fc.get("score",0)),
+                "戰術分":int(a.get("strategy_scores",{}).get(a.get("primary_stage"),0)),
+                "資料品質":int(a.get("data_quality",{}).get("score",0)),
+                "大盤":a.get("market_regime",{}).get("label","中性"),
+                "風險":int(a.get("risk",0)) if finite(a.get("risk")) else None,
+                "風報比":round(float(a.get("rr")),2) if finite(a.get("rr")) else np.nan,
+                "理由":a.get("strategy_reasons",{}).get(a.get("primary_stage"),""),
+            })
+
+    st.markdown('<div class="panel"><div class="panel-title">🎯 高可信度精選</div>', unsafe_allow_html=True)
+    if _hc_rows:
+        _hc = pd.DataFrame(_hc_rows).sort_values(["可信度","戰術分","風報比"],ascending=False).head(10)
+        st.dataframe(_hc,use_container_width=True,hide_index=True)
+        st.caption("只列最終可信度 ≥82 的股票；沒有達標就寧可少選。")
+    else:
+        st.info("目前沒有最終可信度 ≥82 的股票。寧可不硬選。")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ===== 策略回測 =====
     st.markdown(
