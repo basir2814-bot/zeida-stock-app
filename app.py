@@ -10,7 +10,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-09-01-v14-data-quality-dashboard"
+APP_LOGIC_VERSION = "2026-09-01-v15-multipool-scan"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -2134,22 +2134,25 @@ if scan:
             snap["close"].replace(0,np.nan) * 100
         ).replace([np.inf,-np.inf],np.nan).fillna(0)
 
-        # Official snapshot filters that can be applied across the whole market.
+        # 全市場母體初篩：只先排除低價 / 低流動性。
+        # 不能先用「日漲幅 >= X」刪股票，否則④強勢股拉回（常是下跌/小漲）
+        # 和②盤整、③剛起動會在進入歷史K分析前就被消失。
         snap = snap[
             (snap["close"] >= min_price)
             & (snap["activity"] >= min_money*1e8)
-            & (snap["chg_pct"] >= min_day)
         ].copy()
 
         if snap.empty:
             st.warning("目前沒有股票通過初篩條件。")
         else:
             # Rank broad market first; then deep-analyze the strongest 35 so month/MA/KD conditions can be used.
+            # 廣泛排名不再只偏愛「今天漲最多」。
+            # 流動性為主、單日漲幅只小幅加權，避免④拉回股永遠進不了深度分析。
             snap["broad_score"] = (
                 45
-                + snap["activity"].rank(pct=True)*25
-                + snap["lots"].rank(pct=True)*15
-                + snap["chg_pct"].clip(-10,10)*1.5
+                + snap["activity"].rank(pct=True)*28
+                + snap["lots"].rank(pct=True)*17
+                + snap["chg_pct"].clip(-8,8)*0.8
             ).clip(0,100)
             snap = snap.sort_values(["broad_score","activity"],ascending=False).reset_index(drop=True)
 
@@ -2157,8 +2160,36 @@ if scan:
             _market_df = taiex_history()
             market_regime = market_regime_score(_market_df)
 
-            target = snap.head(min(80,len(snap)))
+            # 多路候選池：
+            # A 強勢/啟動池：抓①③⑥
+            # B 拉回池：允許負報酬與小漲，專門避免漏掉④
+            # C 整理池：低波動但有流動性的股票，補②⑧
+            strong_pool = (
+                snap[snap["chg_pct"] >= min_day]
+                .sort_values(["broad_score","activity"], ascending=False)
+                .head(45)
+            )
+            pullback_pool = (
+                snap[snap["chg_pct"].between(-7.0, 4.0)]
+                .sort_values(["activity","lots"], ascending=False)
+                .head(40)
+            )
+            setup_pool = (
+                snap[snap["chg_pct"].between(-2.0, 5.0)]
+                .sort_values(["activity","broad_score"], ascending=False)
+                .head(35)
+            )
 
+            target = (
+                pd.concat([strong_pool, pullback_pool, setup_pool], ignore_index=True)
+                .drop_duplicates("stock_id")
+                .head(110)
+            )
+
+            st.caption(
+                f"深度分析候選：{len(target)} 檔｜強勢池 {len(strong_pool)}｜拉回池 {len(pullback_pool)}｜整理池 {len(setup_pool)}。"
+                " ③/④不再被『日漲幅門檻』提前刪除。"
+            )
             details, inst, fundamentals, shorts, chips = {}, {}, {}, {}, {}
             bar = st.progress(0,text="進行賊大①～⑧與技術分析…")
             for i,z in enumerate(target.itertuples(index=False)):
@@ -2256,7 +2287,8 @@ if scan:
 
                         # 使用者畫面上的可調條件只影響「強勢排行」，不影響賊大分類是否被保留。
                         a["ui_filter_pass"] = (
-                            ((not finite(a["r20"])) or a["r20"] >= min_month)
+                            (float(z.chg_pct) >= min_day if finite(z.chg_pct) else False)
+                            and ((not finite(a["r20"])) or a["r20"] >= min_month)
                             and (season_rule=="不限" or bool(a["ma60_up"]))
                             and (kd_rule=="不限" or bool(a["kd_golden"]))
                         )
