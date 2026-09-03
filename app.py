@@ -11,7 +11,7 @@ st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", la
 
 # ===== 選股邏輯版本 =====
 # 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-09-02-v16-tpex-html-fallback"
+APP_LOGIC_VERSION = "2026-09-03-v18-course-lifecycle-combined"
 
 if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
     for _k in [
@@ -508,6 +508,145 @@ def fetch_tpex_html_fallback():
     return [], None
 
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_otc_codes_from_isin():
+    """
+    第四層備援的股票清單：
+    從 TWSE ISIN 公開頁取得『上櫃』代號與名稱，避開 tpex.org.tw 網域。
+    """
+    urls = [
+        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
+        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEAD, timeout=30)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding or "big5"
+
+            parser = _SimpleTableParser()
+            parser.feed(r.text)
+
+            out = []
+            seen = set()
+            for cells in parser.rows:
+                if not cells:
+                    continue
+
+                # ISIN 第一欄常見格式：「6488　環球晶」
+                joined = " ".join(str(x).strip() for x in cells if str(x).strip())
+                m = re.match(r"^\s*(\d{4})\s+(.+?)(?:\s{2,}|$)", joined)
+                if not m:
+                    # 兼容代號與名稱分欄
+                    c0 = str(cells[0]).strip() if len(cells) > 0 else ""
+                    c1 = str(cells[1]).strip() if len(cells) > 1 else ""
+                    if re.fullmatch(r"\d{4}", c0) and c1:
+                        code = c0
+                        name = c1
+                    else:
+                        continue
+                else:
+                    code = m.group(1)
+                    name = m.group(2).strip()
+
+                # 排除 ETF/ETN/權證/債券等
+                text = " ".join(cells)
+                if re.search(r"ETF|ETN|權證|債券|受益證券|指數", text, re.I):
+                    continue
+
+                if code not in seen:
+                    seen.add(code)
+                    out.append((code, name))
+
+            if len(out) >= 300:
+                return out
+        except Exception:
+            continue
+
+    return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_otc_from_twse_mis():
+    """
+    第四層行情備援：
+    先用 TWSE ISIN 取得上櫃代號，再用 TWSE MIS 批次查 otc_XXXX.tw 即時/最近行情。
+    這條路完全避開 tpex.org.tw，因此 TPEx 網域被 Streamlit Cloud 擋時仍可補資料。
+    """
+    stocks = fetch_otc_codes_from_isin()
+    if not stocks:
+        return [], None
+
+    name_map = dict(stocks)
+    codes = [c for c, _ in stocks]
+
+    session = requests.Session()
+    session.headers.update(HEAD)
+
+    try:
+        # 先拿 cookie，MIS 對雲端環境較穩
+        session.get("https://mis.twse.com.tw/stock/index.jsp", timeout=20)
+    except Exception:
+        pass
+
+    rows = []
+    batch_size = 50
+
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i+batch_size]
+        ex_ch = "|".join(f"otc_{c}.tw" for c in batch)
+
+        try:
+            r = session.get(
+                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                params={"ex_ch": ex_ch, "json": 1, "delay": 0},
+                timeout=30,
+            )
+            r.raise_for_status()
+            j = r.json()
+
+            for x in j.get("msgArray", []):
+                code = str(x.get("c", "")).strip()
+                if not re.fullmatch(r"\d{4}", code):
+                    continue
+
+                name = str(x.get("n") or name_map.get(code, code)).strip()
+                close = to_num(x.get("z"))
+                prev = to_num(x.get("y"))
+                opn = to_num(x.get("o"))
+                high = to_num(x.get("h"))
+                low = to_num(x.get("l"))
+                volume_lots = to_num(x.get("v"))
+
+                # 收盤後 z 偶爾為 "-"；用最佳買/賣不可靠，所以沒有成交價就略過
+                if not finite(close):
+                    continue
+
+                chg = close - prev if finite(prev) else np.nan
+
+                # MIS 的累積成交量 v 常以「張」呈現；成交金額用股價×張數×1000近似，
+                # 只用於流動性初篩，不當作交易所精確成交金額。
+                value = (
+                    close * volume_lots * 1000
+                    if finite(volume_lots) else np.nan
+                )
+
+                rows.append([
+                    code, name, "上櫃",
+                    close, opn, high, low,
+                    volume_lots, value, chg
+                ])
+        except Exception:
+            continue
+
+    # 至少抓回一定數量才視為成功
+    if len(rows) >= 250:
+        return rows, "TWSE ISIN＋MIS"
+    return [], None
+
+
+
 def snapshot():
     rows, warnings = [], []
 
@@ -584,7 +723,24 @@ def snapshot():
             pass
 
     if not tpex_ok:
-        warnings.append("上櫃資料暫時無法取得（OpenAPI 與公開行情備援皆失敗）")
+        # 第四層備援：TWSE ISIN 上櫃清單 + TWSE MIS otc 報價。
+        # 完全避開 tpex.org.tw，可處理 Streamlit Cloud 對 TPEx 網域 HTTPError 的情況。
+        try:
+            _mis_rows, _mis_source = fetch_otc_from_twse_mis()
+            if _mis_rows:
+                rows.extend(_mis_rows)
+                tpex_ok = True
+                warnings.append(
+                    f"TPEx 網域目前無法連線，已自動改用 {_mis_source} 補上櫃行情。"
+                    " 成交金額為依成交量×價格近似值，僅供流動性初篩。"
+                )
+        except Exception:
+            pass
+
+    if not tpex_ok:
+        warnings.append(
+            "上櫃資料仍無法取得（TPEx OpenAPI、TPEx公開行情、TWSE ISIN＋MIS 均失敗）。"
+        )
 
     d = pd.DataFrame(rows, columns=["stock_id","stock_name","market","close","open_today","high_today","low_today","volume","value","change"])
     if not d.empty:
@@ -1165,6 +1321,7 @@ def fundamental_growth(code):
     out = {
         "revenue_yoy":np.nan, "revenue_3m_yoy":np.nan,
         "eps":np.nan, "eps_prev":np.nan, "eps_growth":np.nan,
+        "eps_3q_sum":np.nan, "revenue_record_high":False,
         "pass":False, "confidence":"低", "note":"基本面資料不足"
     }
 
@@ -1206,6 +1363,11 @@ def fundamental_growth(code):
                 out["revenue_yoy"] = float(ys.iloc[-1])
                 out["revenue_3m_yoy"] = float(ys.tail(3).mean())
 
+        # 最近一個月營收是否創目前可取得資料的歷史新高
+        _rv = pd.to_numeric(r["revenue"], errors="coerce").dropna()
+        if len(_rv) >= 12:
+            out["revenue_record_high"] = bool(float(_rv.iloc[-1]) >= float(_rv.max()))
+
     fs = finmind_dataset("TaiwanStockFinancialStatements", code, 1200)
     if not fs.empty:
         # 兼容 type / origin_name / name 等不同欄位
@@ -1227,6 +1389,8 @@ def fundamental_growth(code):
                 out["eps_prev"] = float(ev.iloc[-2])
                 if out["eps_prev"] != 0:
                     out["eps_growth"] = (out["eps"]/out["eps_prev"]-1)*100
+            if len(ev) >= 3:
+                out["eps_3q_sum"] = float(ev.tail(3).sum())
 
     rev_ok = finite(out["revenue_yoy"]) and finite(out["revenue_3m_yoy"]) and out["revenue_yoy"] >= 10 and out["revenue_3m_yoy"] >= 10
     eps_known = finite(out["eps"])
@@ -1521,6 +1685,234 @@ def final_strategy_confidence(a, full_eval, quality, market):
         "label":label,
         "reason":f"戰術{base:.0f} / 資料品質{q:.0f} / 大盤{market.get('label','中性')}；缺資料：{miss}"
     }
+
+
+
+def _to_lots(v):
+    """
+    將股數轉成張數。FinMind 法人與 Yahoo volume 多數以股數計。
+    小於 100000 的數值若本身看起來像張數，仍保留原值，避免過度除1000。
+    """
+    if not finite(v):
+        return np.nan
+    v = float(v)
+    return v / 1000.0 if abs(v) >= 100000 else v
+
+
+def original_course_conditions(a, fund, cp, cap, close):
+    """
+    完全依使用者提供的課程截圖，把條件①～⑤的「數字規則」獨立計算。
+    這層不取代資金生命週期，而是與賊大①～⑧階段判讀交叉驗證。
+    """
+    d = a.get("data")
+    out = {}
+    if d is None or d.empty or len(d) < 45:
+        return out
+
+    c = float(close)
+    shares = cap.get("shares", np.nan)
+    capital = cap.get("capital", np.nan)
+
+    # 價格報酬
+    r10 = (c / float(d["close"].iloc[-11]) - 1) * 100 if len(d) > 11 else np.nan
+    r20 = (c / float(d["close"].iloc[-21]) - 1) * 100 if len(d) > 21 else np.nan
+    r30 = (c / float(d["close"].iloc[-31]) - 1) * 100 if len(d) > 31 else np.nan
+    r40 = (c / float(d["close"].iloc[-41]) - 1) * 100 if len(d) > 41 else np.nan
+
+    # 量能：今日 / 前5日均量（前5日不含今日，更符合「今日相對均量」）
+    vol = pd.to_numeric(d["volume"], errors="coerce")
+    today_vol = float(vol.iloc[-1]) if finite(vol.iloc[-1]) else np.nan
+    prev5_avg = float(vol.iloc[-6:-1].mean()) if len(vol) >= 6 else np.nan
+    vol_ratio5 = today_vol / prev5_avg if finite(today_vol) and finite(prev5_avg) and prev5_avg > 0 else np.nan
+
+    # 週轉率
+    turnover = today_vol / float(shares) * 100 if finite(today_vol) and finite(shares) and shares > 0 else np.nan
+
+    # 法人近10日（轉成張）
+    inst10_lots = _to_lots(cp.get("total10", np.nan))
+    inst10_sell_lots = -inst10_lots if finite(inst10_lots) and inst10_lots < 0 else 0.0
+
+    ma5 = float(d["close"].rolling(5).mean().iloc[-1])
+
+    # 共通排除條件
+    avg5_lots = _to_lots(prev5_avg)
+    common_ok = bool(c > 5 and finite(avg5_lots) and avg5_lots > 500)
+
+    # ①：20日漲幅>10%、1日週轉率>10%、股本<20億
+    c1 = bool(
+        common_ok
+        and finite(r20) and r20 > 10
+        and finite(turnover) and turnover > 10
+        and finite(capital) and capital < 2_000_000_000
+    )
+
+    # ②：今日量 > 5日均量20%、近30日漲跌幅<1%，再看外資投信動態
+    # 「漲跌幅<1%」採 abs()，代表長期橫盤。
+    c2 = bool(
+        common_ok
+        and finite(vol_ratio5) and vol_ratio5 > 0.20
+        and finite(r30) and abs(r30) < 1
+    )
+
+    # ③：10日漲幅>1%、今日量>5日均量300%、今日量>100張、股本<30億
+    today_lots = _to_lots(today_vol)
+    c3 = bool(
+        common_ok
+        and finite(r10) and r10 > 1
+        and finite(vol_ratio5) and vol_ratio5 > 3.0
+        and finite(today_lots) and today_lots > 100
+        and finite(capital) and capital < 3_000_000_000
+    )
+
+    # ④：今日股價<5MA、40日漲幅>30%、近10日三大法人賣超>10000張
+    c4 = bool(
+        common_ok
+        and c < ma5
+        and finite(r40) and r40 > 30
+        and finite(inst10_sell_lots) and inst10_sell_lots > 10000
+    )
+
+    # ⑤：股價<50、近三季EPS合計>0.5、最近月營收歷史新高、YoY>20%
+    eps3 = fund.get("eps_3q_sum", np.nan)
+    rev_yoy = fund.get("revenue_yoy", np.nan)
+    rev_high = bool(fund.get("revenue_record_high", False))
+    c5 = bool(
+        common_ok
+        and c < 50
+        and finite(eps3) and eps3 > 0.5
+        and rev_high
+        and finite(rev_yoy) and rev_yoy > 20
+    )
+
+    out = {
+        "①強勢熱門": {
+            "match": c1, "r20": r20, "turnover": turnover,
+            "capital_b": capital/1e8 if finite(capital) else np.nan,
+            "rule": "20日漲幅>10%＋週轉率>10%＋股本<20億"
+        },
+        "②盤整待突破": {
+            "match": c2, "r30": r30, "vol_ratio5": vol_ratio5,
+            "inst5": _to_lots(cp.get("total5", np.nan)),
+            "rule": "今日量>5日均量20%＋30日漲跌幅絕對值<1%＋法人動態"
+        },
+        "③剛起動": {
+            "match": c3, "r10": r10, "vol_ratio5": vol_ratio5,
+            "today_lots": today_lots, "capital_b": capital/1e8 if finite(capital) else np.nan,
+            "rule": "10日漲幅>1%＋今日量>5日均量300%＋>100張＋股本<30億"
+        },
+        "④強勢股拉回": {
+            "match": c4, "r40": r40, "below_ma5": c < ma5,
+            "inst10_sell_lots": inst10_sell_lots,
+            "rule": "股價<5MA＋40日漲幅>30%＋10日三大法人賣超>10000張"
+        },
+        "⑤營運成長潛力": {
+            "match": c5, "eps3": eps3, "rev_yoy": rev_yoy, "rev_high": rev_high,
+            "rule": "股價<50＋近三季EPS>0.5＋月營收歷史新高＋YoY>20%"
+        },
+        "_common": {
+            "match": common_ok, "price": c, "avg5_lots": avg5_lots,
+            "rule": "股價>5元＋5日均量>500張"
+        }
+    }
+    return out
+
+
+def blend_course_with_lifecycle(full_eval, course):
+    """
+    把『課程原版數字條件』與『賊大資金生命週期』合併：
+    - ①～⑤：原版數字條件 + 階段分數交叉驗證
+    - ⑥～⑧：沿用資金/技術/融券階段判斷
+    """
+    scores = dict(full_eval.get("scores", {}))
+    reasons = dict(full_eval.get("reasons", {}))
+    confidence = dict(full_eval.get("confidence", {}))
+
+    for stage in ["①強勢熱門","②盤整待突破","③剛起動","④強勢股拉回","⑤營運成長潛力"]:
+        cr = course.get(stage, {})
+        if not cr:
+            continue
+        base = float(scores.get(stage, 0))
+        if cr.get("match"):
+            # 原版條件成立：大幅提高，但仍保留生命週期分數作校驗
+            scores[stage] = min(100, round(base*0.60 + 40))
+            reasons[stage] = (reasons.get(stage,"") + "；原版數字條件✅").strip("；")
+        else:
+            # 原版不成立：不直接判死刑，降權後可列「接近」
+            scores[stage] = round(base*0.72)
+            reasons[stage] = (reasons.get(stage,"") + "；原版數字條件未完全成立").strip("；")
+
+        confidence[stage] = (
+            "高" if scores[stage] >= 85 and cr.get("match")
+            else "中" if scores[stage] >= 70
+            else "低"
+        )
+
+    # ①～⑤正式成立：原版 match 且融合分>=70
+    # ⑥～⑧：沿用原本分數/可信度
+    technical_order = ["⑥強勢噴出","④強勢股拉回","③剛起動","⑦跌深轉折","①強勢熱門","⑧整理轉強","②盤整待突破"]
+    eligible = []
+    for stage, sc in scores.items():
+        if stage in ["①強勢熱門","②盤整待突破","③剛起動","④強勢股拉回"]:
+            if course.get(stage,{}).get("match") and sc >= 70:
+                eligible.append(stage)
+        elif stage == "⑤營運成長潛力":
+            # ⑤作基本面副標籤，不搶主技術階段
+            continue
+        elif sc >= 70 and confidence.get(stage) != "低":
+            eligible.append(stage)
+
+    primary = next((x for x in technical_order if x in eligible), None)
+    tags = [primary] if primary else []
+
+    if course.get("⑤營運成長潛力",{}).get("match") and scores.get("⑤營運成長潛力",0) >= 70:
+        tags.append("⑤營運成長潛力")
+
+    near = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
+
+    merged = dict(full_eval)
+    merged.update({
+        "primary": primary,
+        "tags": tags,
+        "scores": scores,
+        "reasons": reasons,
+        "confidence": confidence,
+        "near": near,
+        "course": course,
+    })
+    return merged
+
+
+def daily_homework_labels(a):
+    """
+    對應課程『每天的功課』：
+    1/3/5日強弱、量大股、大幅震盪股、強勢/弱勢。
+    """
+    d = a.get("data")
+    if d is None or len(d) < 25:
+        return []
+    c = float(d["close"].iloc[-1])
+    ret1 = (c/float(d["close"].iloc[-2])-1)*100
+    ret3 = (c/float(d["close"].iloc[-4])-1)*100
+    ret5 = (c/float(d["close"].iloc[-6])-1)*100
+    v = pd.to_numeric(d["volume"], errors="coerce")
+    v20 = float(v.tail(20).mean())
+    vr20 = float(v.iloc[-1])/v20 if v20>0 else np.nan
+    rng5 = (float(d["max"].tail(5).max())/float(d["min"].tail(5).min())-1)*100
+    ma5 = float(d["close"].rolling(5).mean().iloc[-1])
+    ma10 = float(d["close"].rolling(10).mean().iloc[-1])
+
+    labels = []
+    if ret1 > 2: labels.append("1日強勢")
+    if ret3 > 4: labels.append("3日強勢")
+    if ret5 > 6: labels.append("5日強勢")
+    if ret1 < -2: labels.append("1日弱勢")
+    if ret3 < -4: labels.append("3日弱勢")
+    if ret5 < -6: labels.append("5日弱勢")
+    if finite(vr20) and vr20 >= 1.8: labels.append("量大股")
+    if rng5 >= 12: labels.append("大幅震盪股")
+    if c > ma5 > ma10: labels.append("強勢股")
+    if c < ma5 < ma10: labels.append("弱勢股")
+    return labels
 
 
 def evaluate_zeida_full(a, fund, sh, cp, cap, close, day_chg=np.nan):
@@ -2314,6 +2706,10 @@ if scan:
                             day_chg=z.chg_pct if finite(z.chg_pct) else np.nan
                         )
 
+                        # 課程原版數字條件①～⑤ + 賊大資金生命週期交叉驗證
+                        course_eval = original_course_conditions(a, fund, cp, cap, z.close)
+                        full_eval = blend_course_with_lifecycle(full_eval, course_eval)
+
                         quality = data_quality_score(a, fund, sh, cp, cap)
                         final_conf = final_strategy_confidence(a, full_eval, quality, market_regime)
 
@@ -2334,6 +2730,8 @@ if scan:
                         a["strategy_reasons"] = full_eval.get("reasons", {})
                         a["strategy_confidence"] = full_eval.get("confidence", {})
                         a["strategy_near"] = full_eval.get("near", [])
+                        a["course_conditions"] = full_eval.get("course", {})
+                        a["homework_labels"] = daily_homework_labels(a)
                         a["data_quality"] = quality
                         a["data_quality_breakdown"] = data_quality_breakdown(a, fund, sh, cp, cap)
                         a["market_regime"] = market_regime
@@ -2555,6 +2953,8 @@ if "snap" in st.session_state:
                 "最終可信度": int(a.get("final_confidence",{}).get("score",0) or 0),
                 "資料品質": int(a.get("data_quality",{}).get("score",0) or 0),
                 "大盤": a.get("market_regime",{}).get("label","中性"),
+                "原版條件": "✅" if a.get("course_conditions",{}).get(target_tag,{}).get("match") else ("—" if target_tag in ["⑥強勢噴出","⑦跌深轉折","⑧整理轉強"] else "❌"),
+                "每日功課": "、".join(a.get("homework_labels",[])[:3]),
             })
 
 
@@ -2680,6 +3080,66 @@ if "snap" in st.session_state:
 
 
 
+
+
+    # ===== 原版條件 × 資金生命週期 =====
+    st.markdown('<div class="panel"><div class="panel-title">🧭 原版賊大條件 × 資金生命週期</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="legend-grid">'
+        '<div class="legend"><h4>課程原版數字條件</h4><p>'
+        '① 20日漲幅&gt;10%＋週轉&gt;10%＋股本&lt;20億。<br>'
+        '② 今日量&gt;5日均量20%＋30日漲跌幅絕對值&lt;1%＋法人動態。<br>'
+        '③ 10日漲幅&gt;1%＋今日量&gt;5日均量300%＋&gt;100張＋股本&lt;30億。<br>'
+        '④ 股價&lt;5MA＋40日漲幅&gt;30%＋10日三大法人賣超&gt;10000張。<br>'
+        '⑤ 股價&lt;50＋近三季EPS&gt;0.5＋月營收歷史新高＋YoY&gt;20%。'
+        '</p></div>'
+        '<div class="legend"><h4>資金生命週期確認</h4><p>'
+        '⑤ 起漲前夕 → ② 突破前整理 → ⑧ 整理吸籌 → ③ 起漲初期 → '
+        '① 主升初期 → ④ 主升回檔 → ⑥ 主升軋空。<br>'
+        '⑦ 為跌深反轉的另一條路徑。'
+        '</p></div>'
+        '<div class="legend"><h4>合併判斷方式</h4><p>'
+        '①～⑤先跑課程原版數字條件，再用價量、均線、法人、融券確認所處階段。'
+        '原版條件沒過，不硬塞正式分類；但會保留在接近候選。'
+        '⑥～⑧則以資金/籌碼與型態判讀為主。'
+        '</p></div>'
+        '<div class="legend"><h4>共通排除</h4><p>'
+        '股價≤5元排除；5日均量≤500張排除。'
+        '資料抓不到時不當成0，改降低資料品質與可信度。'
+        '</p></div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ===== 每日功課掃描 =====
+    st.markdown('<div class="panel"><div class="panel-title">📚 每日功課掃描</div>', unsafe_allow_html=True)
+    _hw_rows = []
+    for z in snap.itertuples(index=False):
+        a = details.get(z.stock_id)
+        if not a:
+            continue
+        for lab in a.get("homework_labels", []):
+            _hw_rows.append({
+                "分類": lab,
+                "代號": str(z.stock_id),
+                "名稱": str(z.stock_name),
+                "股價": float(z.close) if finite(z.close) else np.nan,
+                "漲跌幅%": float(z.chg_pct) if finite(z.chg_pct) else np.nan,
+                "主階段": a.get("primary_stage") or "未正式成立",
+                "可信度": int(a.get("final_confidence",{}).get("score",0) or 0),
+            })
+    if _hw_rows:
+        _hw = pd.DataFrame(_hw_rows)
+        _order = ["1日強勢","3日強勢","5日強勢","1日弱勢","3日弱勢","5日弱勢","量大股","大幅震盪股","強勢股","弱勢股"]
+        _counts = _hw.groupby("分類").size().reindex(_order).dropna().astype(int)
+        st.caption("｜".join(f"{k} {v}檔" for k,v in _counts.items()))
+        _hw_pick = st.selectbox("查看每日功課分類", _order, key="homework_category")
+        _show = _hw[_hw["分類"] == _hw_pick].sort_values(["可信度","漲跌幅%"], ascending=False)
+        st.dataframe(_show, use_container_width=True, hide_index=True)
+    else:
+        st.info("目前沒有足夠資料產生每日功課分類。")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ===== 資料品質儀表板 =====
     st.markdown('<div class="panel"><div class="panel-title">🧩 資料品質儀表板</div>', unsafe_allow_html=True)
