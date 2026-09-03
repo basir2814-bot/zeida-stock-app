@@ -1,3622 +1,856 @@
-import re, time
-from html.parser import HTMLParser
-import numpy as np
-import pandas as pd
-import requests
+
 import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+import requests
+import time
+import re
+from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="賊大戰術 Pro 免費版", page_icon="📈", layout="wide")
+st.set_page_config(page_title="賊大選股", page_icon="📈", layout="wide")
 
-# ===== 選股邏輯版本 =====
-# 每次核心分類規則更新就更換版本；避免 Streamlit Session State 繼續顯示舊掃描結果。
-APP_LOGIC_VERSION = "2026-09-03-v18-course-lifecycle-combined"
+# =========================================================
+# 賊大選股 Core v1
+# 原則：
+# 1) 僅依課程圖片條件①～⑤
+# 2) 官方 TWSE / TPEx 為價格與公司主檔主來源
+# 3) FinMind 僅用於「已經初篩後」的法人 / EPS 深度確認
+# 4) 缺資料 = NA，不用 0 假裝
+# 5) 每檔顯示實際數值與 ✅ / ❌
+# =========================================================
 
-if st.session_state.get("_logic_version") != APP_LOGIC_VERSION:
-    for _k in [
-        "snap", "details", "inst", "fundamentals", "shorts", "chips",
-        "top_show_n", "zeida_show_n"
-    ]:
-        st.session_state.pop(_k, None)
-    st.session_state["_logic_version"] = APP_LOGIC_VERSION
-    st.session_state["_logic_updated_notice"] = True
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ZeidaStock/1.0; +https://streamlit.io)"
+}
+TIMEOUT = 20
 
+TWSE_DAY = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+TPEX_DAY = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+TWSE_PROFILE = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_PROFILE = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+TWSE_REVENUE = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+TPEX_REVENUE = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
 
+FINMIND_DATA = "https://api.finmindtrade.com/api/v4/data"
 
+# ---------------------------
+# 工具
+# ---------------------------
 
-if st.session_state.pop("_logic_updated_notice", False):
-    st.info("選股分類規則已更新，舊掃描結果已自動清除。請按一次「執行全市場掃描」重新計算。")
-
-st.markdown(r'''
-<style>
-/* ===== 賊大戰術 Pro：深色統一主題 v2 ===== */
-:root{
-  --z-bg:#050b14;
-  --z-bg2:#07131f;
-  --z-panel:#0b1826;
-  --z-panel2:#0e2032;
-  --z-line:#1d4262;
-  --z-line2:#2a5f87;
-  --z-text:#edf6ff;
-  --z-muted:#98aec3;
-  --z-blue:#38a8ff;
-  --z-cyan:#4fdcff;
-  --z-green:#38d987;
-  --z-yellow:#ffc14f;
-  --z-orange:#ff9f35;
-  --z-red:#ff6469;
-  --z-purple:#b881ff;
-}
-
-html,body,[data-testid="stAppViewContainer"],.stApp{
-  background:
-    radial-gradient(circle at 12% 0%,rgba(24,90,148,.22),transparent 28%),
-    radial-gradient(circle at 88% 0%,rgba(53,41,120,.13),transparent 24%),
-    linear-gradient(180deg,#040a12 0%,#06111c 45%,#071522 100%)!important;
-  color:var(--z-text)!important;
-}
-
-[data-testid="stHeader"]{
-  background:rgba(4,10,18,.88)!important;
-  backdrop-filter:blur(8px);
-}
-[data-testid="stToolbar"]{
-  background:transparent!important;
-}
-[data-testid="stDecoration"]{display:none!important;}
-
-.block-container{
-  max-width:1500px!important;
-  padding-top:1rem!important;
-}
-
-/* 一般文字 */
-h1,h2,h3,h4,h5,h6,p,span,label,div{
-  color:inherit;
-}
-[data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] li{
-  color:#d8e5f1;
-}
-
-/* Streamlit 原生卡片/區塊 */
-[data-testid="stVerticalBlockBorderWrapper"]{
-  background:rgba(8,22,35,.76)!important;
-  border-color:#1f4565!important;
-  border-radius:12px!important;
-}
-
-/* Selectbox / NumberInput / TextInput */
-div[data-baseweb="select"] > div,
-div[data-baseweb="input"] > div,
-[data-testid="stNumberInput"] input,
-[data-testid="stTextInput"] input{
-  background:#091827!important;
-  color:#eef7ff!important;
-  border-color:#28516f!important;
-}
-div[data-baseweb="select"] svg{fill:#9dc8e9!important;}
-div[data-baseweb="popover"]{
-  background:#0a1928!important;
-}
-div[role="listbox"]{
-  background:#0a1928!important;
-  border:1px solid #2a5578!important;
-}
-div[role="option"]{
-  background:#0a1928!important;
-  color:#eaf5ff!important;
-}
-div[role="option"]:hover{
-  background:#12304b!important;
-}
-
-/* 按鈕 */
-.stButton > button{
-  background:linear-gradient(180deg,#1c9fff,#0b72d4)!important;
-  color:#fff!important;
-  border:1px solid #53baff!important;
-  box-shadow:0 0 16px rgba(32,150,255,.16)!important;
-}
-.stButton > button:hover{
-  background:linear-gradient(180deg,#35adff,#1280e8)!important;
-  border-color:#86ceff!important;
-}
-
-/* Checkbox / Toggle */
-[data-testid="stCheckbox"] label,
-[data-testid="stToggle"] label{
-  color:#dce9f4!important;
-}
-
-/* Dataframe：把原本白色表格改成深色 */
-[data-testid="stDataFrame"],
-[data-testid="stDataFrameResizable"]{
-  background:#081522!important;
-  border:1px solid #214866!important;
-  border-radius:10px!important;
-  overflow:hidden!important;
-}
-[data-testid="stDataFrame"] iframe{
-  background:#081522!important;
-}
-
-/* Streamlit dataframe 目前使用 Glide Data Grid，直接覆蓋 CSS variables */
-[data-testid="stDataFrame"]{
-  --gdg-bg-cell:#091827!important;
-  --gdg-bg-cell-medium:#0d2032!important;
-  --gdg-bg-header:#10283d!important;
-  --gdg-bg-header-hovered:#163650!important;
-  --gdg-bg-header-has-focus:#173b59!important;
-  --gdg-text-dark:#eef7ff!important;
-  --gdg-text-medium:#c8d7e5!important;
-  --gdg-text-light:#91a7ba!important;
-  --gdg-accent-color:#38a8ff!important;
-  --gdg-accent-light:rgba(56,168,255,.18)!important;
-  --gdg-border-color:#244965!important;
-}
-
-/* Alert / info */
-[data-testid="stAlert"]{
-  background:#0c2133!important;
-  border:1px solid #27577b!important;
-  color:#dcecff!important;
-}
-[data-testid="stAlert"] p{color:#dcecff!important;}
-
-/* Expander */
-[data-testid="stExpander"]{
-  background:#091827!important;
-  border:1px solid #214663!important;
-  border-radius:10px!important;
-}
-[data-testid="stExpander"] summary{
-  color:#eaf5ff!important;
-}
-
-/* Tabs */
-[data-baseweb="tab-list"]{
-  background:#081522!important;
-  border:1px solid #1e4362!important;
-  border-radius:9px!important;
-  padding:4px!important;
-}
-[data-baseweb="tab"]{
-  color:#afc4d7!important;
-  background:transparent!important;
-}
-[aria-selected="true"][data-baseweb="tab"]{
-  color:#64bcff!important;
-  background:#0d2c47!important;
-  border-radius:7px!important;
-}
-
-/* Plotly 圖表外框 */
-[data-testid="stPlotlyChart"]{
-  background:#081522!important;
-  border:1px solid #214761!important;
-  border-radius:10px!important;
-  padding:4px!important;
-}
-
-/* Metric */
-[data-testid="stMetric"]{
-  background:linear-gradient(180deg,#0c1c2c,#081522)!important;
-  border:1px solid #214965!important;
-  border-radius:10px!important;
-  padding:12px!important;
-}
-[data-testid="stMetricLabel"]{color:#9fb5c8!important;}
-[data-testid="stMetricValue"]{color:#f4f9ff!important;}
-
-/* 手機版 */
-@media(max-width:900px){
-  .block-container{padding-left:.55rem!important;padding-right:.55rem!important;}
-  [data-testid="stDataFrame"]{font-size:12px!important;}
-  .summary-card{background:linear-gradient(180deg,#0c1b2a,#071521)!important;}
-  .hero{background:linear-gradient(180deg,#0b1b2b,#07131f)!important;}
-  .panel,.section,.filterbox,.detail-card,.legend{
-    background:#081624!important;
-  }
-}
-</style>
-''', unsafe_allow_html=True)
-
-
-TWSE = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-TPEX = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-YAHOO_HOSTS = [
-    "https://query1.finance.yahoo.com/v8/finance/chart",
-    "https://query2.finance.yahoo.com/v8/finance/chart",
-]
-HEAD = {"User-Agent": "Mozilla/5.0"}
-
-st.markdown("""
-
-<style>
-:root{
-  --bg:#07111d;
-  --panel:#0b1725;
-  --panel2:#0e1d2e;
-  --line:#1c3a58;
-  --line2:#23517a;
-  --text:#eef6ff;
-  --muted:#9fb1c2;
-  --blue:#2d9cff;
-  --green:#35d07f;
-  --orange:#ffad32;
-  --red:#ff5e63;
-  --purple:#b36cff;
-  --cyan:#45d6ff;
-}
-html, body, [class*="css"] {font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",sans-serif;}
-.stApp{
-  background:
-    radial-gradient(circle at 20% 0%, rgba(28,86,140,.18), transparent 30%),
-    linear-gradient(180deg,#06101b 0%,#081522 100%);
-  color:var(--text);
-}
-.block-container{max-width:1480px;padding-top:1.2rem;padding-bottom:2rem;}
-[data-testid="stHeader"]{background:transparent;}
-[data-testid="stToolbar"]{right:12px;}
-
-.hero{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:18px 22px;border:1px solid var(--line2);border-radius:12px;
-  background:linear-gradient(180deg,rgba(13,30,47,.96),rgba(7,20,33,.96));
-  box-shadow:0 12px 28px rgba(0,0,0,.22);
-  margin-bottom:10px;
-}
-.hero-left{display:flex;align-items:center;gap:14px;}
-.hero-icon{font-size:38px;filter:drop-shadow(0 0 10px rgba(45,156,255,.25));}
-.hero-title{font-size:30px;font-weight:900;letter-spacing:.4px;color:#fff;}
-.hero-title .pro{color:var(--orange);}
-.hero-sub{font-size:14px;color:#c6d4e3;margin-top:4px;}
-.hero-meta{text-align:right;font-size:13px;color:#b8c6d5;line-height:1.7;}
-.badge-live{color:#6df3a6;font-weight:700;}
-
-.navbar{
-  display:grid;grid-template-columns:repeat(5,1fr);
-  border:1px solid var(--line);border-radius:10px;overflow:hidden;
-  background:#0a1725;margin-bottom:12px;
-}
-.navitem{padding:12px 10px;text-align:center;border-right:1px solid #18324d;color:#c8d5e3;font-weight:700;}
-.navitem:last-child{border-right:none;}
-.navitem.active{background:linear-gradient(180deg,#0b3156,#0a2440);color:#68baff;box-shadow:inset 0 -2px 0 #1f9dff;}
-
-.section{
-  border:1px solid var(--line);border-radius:12px;background:rgba(9,23,37,.92);
-  padding:14px;margin:12px 0;
-}
-.section-title{
-  font-size:18px;font-weight:900;color:#5eb6ff;margin:0 0 12px 0;
-  display:flex;align-items:center;gap:8px;
-}
-.summary-grid{
-  display:grid;grid-template-columns:repeat(6,minmax(150px,1fr));gap:10px;
-}
-.summary-card{
-  min-height:118px;border:1px solid #21435f;border-radius:10px;
-  background:linear-gradient(180deg,#0c1b2a,#091624);
-  padding:12px 14px;display:flex;flex-direction:column;justify-content:center;
-}
-.summary-card .label{font-size:14px;color:#d5e0eb;margin-bottom:8px;}
-.summary-card .big{font-size:28px;font-weight:900;letter-spacing:.4px;}
-.summary-card .small{font-size:12px;color:#9eb1c4;margin-top:6px;line-height:1.5;}
-.summary-card.green{border-color:#1f694d;background:linear-gradient(180deg,#0c2a24,#081b1b);}.summary-card.green .big{color:var(--green);}
-.summary-card.orange{border-color:#6d4b22;background:linear-gradient(180deg,#2b2112,#17170f);}.summary-card.orange .big{color:var(--orange);}
-.summary-card.purple{border-color:#594077;background:linear-gradient(180deg,#211b31,#151225);}.summary-card.purple .big{color:var(--purple);}
-.summary-card.red{border-color:#ad3f48;box-shadow:0 0 0 1px rgba(255,94,99,.12);}
-.summary-card.red .big{color:var(--red);}
-.summary-card.blue{border-color:#28577b;background:linear-gradient(180deg,#0b2237,#081724);}.summary-card.blue .big{color:#49a8ff;}
-
-.filterbox{
-  border:1px solid var(--line);border-radius:12px;background:#091725;padding:14px 14px 4px;margin:12px 0;
-}
-[data-testid="stSelectbox"] label, [data-testid="stNumberInput"] label{font-size:12px!important;color:#b8c8d8!important;}
-.stSelectbox div[data-baseweb="select"]>div{background:#0b1b2c;border-color:#274a6b;color:#eef6ff;}
-.stButton>button{
-  background:linear-gradient(180deg,#1591ff,#0873d1);color:white;border:1px solid #4cb2ff;
-  border-radius:8px;font-weight:800;min-height:40px;
-}
-.stButton>button:hover{border-color:#88caff;color:#fff;}
-
-.panel{
-  border:1px solid var(--line);border-radius:12px;background:#091725;
-  padding:12px 12px 14px;margin:12px 0;
-}
-.panel-title{font-size:19px;font-weight:900;color:#5eb6ff;margin-bottom:10px;}
-
-.table-wrap{overflow-x:auto;border:1px solid #1d3d59;border-radius:9px;background:#07131f;}
-.stock-table{border-collapse:separate;border-spacing:0;width:100%;min-width:1500px;font-size:12px;color:#dbe8f5;}
-.stock-table th{
-  position:sticky;top:0;z-index:2;background:#0e2235;color:#d8e6f4;
-  padding:9px 7px;border-right:1px solid #24445f;border-bottom:1px solid #355b79;white-space:nowrap;
-}
-.stock-table td{
-  padding:8px 7px;border-right:1px solid #18334b;border-bottom:1px solid #173148;
-  white-space:nowrap;text-align:center;
-}
-.stock-table tr:hover td{background:#0d2031;}
-.stock-table .rank{font-weight:900;color:#fff;}
-.stock-table .code{color:#77bbff;font-weight:800;}
-.stock-table .price{font-weight:900;color:#ffd36a;}
-.stock-table .up{color:#ff696f;font-weight:900;}
-.stock-table .down{color:#5ad68a;font-weight:900;}
-.stock-table .volr{color:#ffb34a;font-weight:800;}
-.stock-table .rr{color:#ffd45b;font-weight:900;}
-.stock-table .grade{color:#7af1af;font-weight:900;}
-.risk-low{color:#69e79f;font-weight:900;}
-.risk-mid{color:#ffbb4d;font-weight:900;}
-.risk-high{color:#ff6d73;font-weight:900;}
-
-.legend-grid{
-  display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px;
-}
-.legend{
-  border:1px solid #1d3d59;border-radius:10px;background:#0b1826;padding:12px;
-  min-height:210px;
-}
-.legend h4{margin:0 0 10px;color:#62b8ff;font-size:16px;}
-.legend p,.legend li{font-size:12px;line-height:1.7;color:#c5d2df;}
-
-.detail-grid{
-  display:grid;grid-template-columns:minmax(0,2.1fr) minmax(240px,.9fr) minmax(240px,.9fr);
-  gap:10px;
-}
-.detail-card{border:1px solid #1d3d59;border-radius:10px;background:#0b1826;padding:12px;}
-.metric-row{display:flex;justify-content:space-between;border-bottom:1px solid #173248;padding:7px 0;font-size:13px;}
-.metric-row:last-child{border-bottom:none;}
-.metric-row .k{color:#9eb0c2}.metric-row .v{font-weight:800;color:#eef6ff}
-
-@media(max-width:900px){
-  .block-container{padding-left:.6rem;padding-right:.6rem;}
-  .hero{padding:14px;align-items:flex-start}
-  .hero-title{font-size:24px}.hero-icon{font-size:30px}
-  .hero-meta{font-size:11px}
-  .navbar{grid-template-columns:repeat(5,minmax(110px,1fr));overflow-x:auto}
-  .navitem{font-size:12px}
-  .summary-grid{grid-template-columns:repeat(2,1fr)}
-  .summary-card{min-height:105px}
-  .legend-grid{grid-template-columns:1fr}
-  .detail-grid{grid-template-columns:1fr}
-}
-</style>
-
-""", unsafe_allow_html=True)
-
-def to_num(v):
+def safe_num(v):
     if v is None:
         return np.nan
-    s = str(v).replace(",", "").replace("--", "").replace("---", "").replace("X", "").strip()
+    s = str(v).strip().replace(",", "").replace("＋", "").replace("+", "")
+    s = s.replace("−", "-").replace("—", "").replace("--", "").replace("－", "")
+    if s in {"", "N/A", "NA", "null", "None", "-"}:
+        return np.nan
+    # 去除 % / 元 / 股 / 張 等非數字尾碼
+    s = s.replace("%", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return np.nan
     try:
-        return float(s)
-    except:
+        return float(m.group())
+    except Exception:
         return np.nan
 
-def pick(row, keys):
-    for k in keys:
-        if k in row:
-            v = row[k]
-            if str(v).strip() not in ("", "-", "--", "None"):
+def first_present(row, names=(), contains=()):
+    for n in names:
+        if n in row and str(row[n]).strip() not in {"", "-", "－"}:
+            return row[n]
+    for k, v in row.items():
+        kk = str(k).lower().replace(" ", "").replace("_", "").replace(".", "")
+        if any(c.lower().replace(" ", "").replace("_", "").replace(".", "") in kk for c in contains):
+            if str(v).strip() not in {"", "-", "－"}:
                 return v
     return None
 
-def finite(v):
-    try:
-        return bool(np.isfinite(float(v)))
-    except:
-        return False
-
-def gt(a, b):
-    return finite(a) and finite(b) and float(a) > float(b)
-
-def ge(a, b):
-    return finite(a) and finite(b) and float(a) >= float(b)
-
-def lt(a, b):
-    return finite(a) and finite(b) and float(a) < float(b)
-
-@st.cache_data(ttl=900, show_spinner=False)
-
-class _SimpleTableParser(HTMLParser):
-    """只用 Python 標準庫解析 TPEx HTML 表格，避免新增 bs4/lxml 依賴。"""
-    def __init__(self):
-        super().__init__()
-        self.rows = []
-        self._row = None
-        self._cell = None
-        self._in_td = False
-        self._in_th = False
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "tr":
-            self._row = []
-        elif tag in ("td", "th") and self._row is not None:
-            self._cell = []
-            self._in_td = tag == "td"
-            self._in_th = tag == "th"
-
-    def handle_data(self, data):
-        if self._cell is not None and (self._in_td or self._in_th):
-            self._cell.append(data)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag in ("td", "th") and self._cell is not None and self._row is not None:
-            txt = "".join(self._cell).replace("\xa0", " ").strip()
-            self._row.append(txt)
-            self._cell = None
-            self._in_td = False
-            self._in_th = False
-        elif tag == "tr" and self._row is not None:
-            if self._row:
-                self.rows.append(self._row)
-            self._row = None
-
-
-def fetch_tpex_html_fallback():
-    """
-    TPEx OpenAPI 若 HTTPError，改抓櫃買中心公開的「上櫃股票行情」HTML。
-    欄位：代號、名稱、收盤、漲跌、開盤、最高、最低、均價、成交股數、成交金額...
-    """
-    urls = [
-        "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=htm",
-        "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?d=&l=zh-tw&o=htm",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEAD, timeout=30)
-            r.raise_for_status()
-            if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
-                try:
-                    r.encoding = r.apparent_encoding or "utf-8"
-                except Exception:
-                    r.encoding = "utf-8"
-
-            parser = _SimpleTableParser()
-            parser.feed(r.text)
-
-            out = []
-            for cells in parser.rows:
-                if len(cells) < 10:
-                    continue
-
-                code = str(cells[0]).strip()
-                if not re.fullmatch(r"\d{4}", code):
-                    continue
-
-                name = str(cells[1]).strip()
-                close = to_num(cells[2])
-                chg = to_num(cells[3])
-                opn = to_num(cells[4])
-                high = to_num(cells[5])
-                low = to_num(cells[6])
-                vol = to_num(cells[8])
-                val = to_num(cells[9])
-
-                if finite(close):
-                    out.append([code, name, "上櫃", close, opn, high, low, vol, val, chg])
-
-            if len(out) >= 300:
-                return out, "TPEx公開行情HTML"
-        except Exception:
-            continue
-
-    return [], None
-
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_otc_codes_from_isin():
-    """
-    第四層備援的股票清單：
-    從 TWSE ISIN 公開頁取得『上櫃』代號與名稱，避開 tpex.org.tw 網域。
-    """
-    urls = [
-        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
-        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEAD, timeout=30)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding or "big5"
-
-            parser = _SimpleTableParser()
-            parser.feed(r.text)
-
-            out = []
-            seen = set()
-            for cells in parser.rows:
-                if not cells:
-                    continue
-
-                # ISIN 第一欄常見格式：「6488　環球晶」
-                joined = " ".join(str(x).strip() for x in cells if str(x).strip())
-                m = re.match(r"^\s*(\d{4})\s+(.+?)(?:\s{2,}|$)", joined)
-                if not m:
-                    # 兼容代號與名稱分欄
-                    c0 = str(cells[0]).strip() if len(cells) > 0 else ""
-                    c1 = str(cells[1]).strip() if len(cells) > 1 else ""
-                    if re.fullmatch(r"\d{4}", c0) and c1:
-                        code = c0
-                        name = c1
-                    else:
-                        continue
-                else:
-                    code = m.group(1)
-                    name = m.group(2).strip()
-
-                # 排除 ETF/ETN/權證/債券等
-                text = " ".join(cells)
-                if re.search(r"ETF|ETN|權證|債券|受益證券|指數", text, re.I):
-                    continue
-
-                if code not in seen:
-                    seen.add(code)
-                    out.append((code, name))
-
-            if len(out) >= 300:
-                return out
-        except Exception:
-            continue
-
-    return []
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_otc_from_twse_mis():
-    """
-    第四層行情備援：
-    先用 TWSE ISIN 取得上櫃代號，再用 TWSE MIS 批次查 otc_XXXX.tw 即時/最近行情。
-    這條路完全避開 tpex.org.tw，因此 TPEx 網域被 Streamlit Cloud 擋時仍可補資料。
-    """
-    stocks = fetch_otc_codes_from_isin()
-    if not stocks:
-        return [], None
-
-    name_map = dict(stocks)
-    codes = [c for c, _ in stocks]
-
-    session = requests.Session()
-    session.headers.update(HEAD)
-
-    try:
-        # 先拿 cookie，MIS 對雲端環境較穩
-        session.get("https://mis.twse.com.tw/stock/index.jsp", timeout=20)
-    except Exception:
-        pass
-
-    rows = []
-    batch_size = 50
-
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i+batch_size]
-        ex_ch = "|".join(f"otc_{c}.tw" for c in batch)
-
-        try:
-            r = session.get(
-                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-                params={"ex_ch": ex_ch, "json": 1, "delay": 0},
-                timeout=30,
-            )
-            r.raise_for_status()
-            j = r.json()
-
-            for x in j.get("msgArray", []):
-                code = str(x.get("c", "")).strip()
-                if not re.fullmatch(r"\d{4}", code):
-                    continue
-
-                name = str(x.get("n") or name_map.get(code, code)).strip()
-                close = to_num(x.get("z"))
-                prev = to_num(x.get("y"))
-                opn = to_num(x.get("o"))
-                high = to_num(x.get("h"))
-                low = to_num(x.get("l"))
-                volume_lots = to_num(x.get("v"))
-
-                # 收盤後 z 偶爾為 "-"；用最佳買/賣不可靠，所以沒有成交價就略過
-                if not finite(close):
-                    continue
-
-                chg = close - prev if finite(prev) else np.nan
-
-                # MIS 的累積成交量 v 常以「張」呈現；成交金額用股價×張數×1000近似，
-                # 只用於流動性初篩，不當作交易所精確成交金額。
-                value = (
-                    close * volume_lots * 1000
-                    if finite(volume_lots) else np.nan
-                )
-
-                rows.append([
-                    code, name, "上櫃",
-                    close, opn, high, low,
-                    volume_lots, value, chg
-                ])
-        except Exception:
-            continue
-
-    # 至少抓回一定數量才視為成功
-    if len(rows) >= 250:
-        return rows, "TWSE ISIN＋MIS"
-    return [], None
-
-
-
-def snapshot():
-    rows, warnings = [], []
-
-    try:
-        r = requests.get(TWSE, headers=HEAD, timeout=30)
-        r.raise_for_status()
-        for x in r.json():
-            code = str(pick(x, ["Code", "證券代號", "股票代號"]) or "").strip()
-            name = str(pick(x, ["Name", "證券名稱", "股票名稱"]) or "").strip()
-            close = to_num(pick(x, ["ClosingPrice", "收盤價", "Close"]))
-            opn = to_num(pick(x, ["OpeningPrice", "開盤價", "Open"]))
-            high = to_num(pick(x, ["HighestPrice", "最高價", "High"]))
-            low = to_num(pick(x, ["LowestPrice", "最低價", "Low"]))
-            vol = to_num(pick(x, ["TradeVolume", "成交股數", "Trading_Volume"]))
-            val = to_num(pick(x, ["TradeValue", "成交金額", "Trading_money"]))
-            chg = to_num(pick(x, ["Change", "漲跌價差", "ChangePrice"]))
-            if re.fullmatch(r"\d{4}", code) and finite(close):
-                rows.append([code, name, "上市", close, opn, high, low, vol, val, chg])
-    except Exception as e:
-        warnings.append(f"上市資料暫時無法取得：{type(e).__name__}")
-
-    # 上櫃資料：TPEx 主來源 + 官方備援
-    tpex_ok = False
-    tpex_urls = [
-        TPEX,
-        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
-    ]
-
-    for _url in tpex_urls:
-        try:
-            r = requests.get(_url, headers=HEAD, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list) or len(data) == 0:
-                continue
-
-            before = len(rows)
-            for x in data:
-                code = str(pick(x, [
-                    "SecuritiesCompanyCode", "SecuritiesCode", "Code",
-                    "證券代號", "股票代號"
-                ]) or "").strip()
-                name = str(pick(x, [
-                    "CompanyName", "SecuritiesCompanyName", "Name",
-                    "證券名稱", "股票名稱"
-                ]) or "").strip()
-                close = to_num(pick(x, ["Close", "ClosingPrice", "收盤價"]))
-                opn = to_num(pick(x, ["Open", "OpeningPrice", "開盤價"]))
-                high = to_num(pick(x, ["High", "HighestPrice", "最高價"]))
-                low = to_num(pick(x, ["Low", "LowestPrice", "最低價"]))
-                vol = to_num(pick(x, ["TradingShares", "TradeVolume", "成交股數", "成交量"]))
-                val = to_num(pick(x, ["TransactionAmount", "TradeValue", "成交金額"]))
-                chg = to_num(pick(x, ["Change", "ChangePrice", "漲跌價差"]))
-
-                if re.fullmatch(r"\d{4}", code) and finite(close):
-                    rows.append([code, name, "上櫃", close, opn, high, low, vol, val, chg])
-
-            if len(rows) > before:
-                tpex_ok = True
-                break
-        except Exception:
-            continue
-
-    if not tpex_ok:
-        # 第三層備援：TPEx 公開「上櫃股票行情」HTML。
-        # 這個來源與 OpenAPI 是不同路徑，OpenAPI HTTPError 時仍有機會正常取得。
-        try:
-            _html_rows, _html_source = fetch_tpex_html_fallback()
-            if _html_rows:
-                rows.extend(_html_rows)
-                tpex_ok = True
-                warnings.append(f"上櫃 OpenAPI 暫時失敗，已自動改用 {_html_source}。")
-        except Exception:
-            pass
-
-    if not tpex_ok:
-        # 第四層備援：TWSE ISIN 上櫃清單 + TWSE MIS otc 報價。
-        # 完全避開 tpex.org.tw，可處理 Streamlit Cloud 對 TPEx 網域 HTTPError 的情況。
-        try:
-            _mis_rows, _mis_source = fetch_otc_from_twse_mis()
-            if _mis_rows:
-                rows.extend(_mis_rows)
-                tpex_ok = True
-                warnings.append(
-                    f"TPEx 網域目前無法連線，已自動改用 {_mis_source} 補上櫃行情。"
-                    " 成交金額為依成交量×價格近似值，僅供流動性初篩。"
-                )
-        except Exception:
-            pass
-
-    if not tpex_ok:
-        warnings.append(
-            "上櫃資料仍無法取得（TPEx OpenAPI、TPEx公開行情、TWSE ISIN＋MIS 均失敗）。"
-        )
-
-    d = pd.DataFrame(rows, columns=["stock_id","stock_name","market","close","open_today","high_today","low_today","volume","value","change"])
-    if not d.empty:
-        d = d.drop_duplicates("stock_id", keep="last")
-        d = d[~d.stock_name.astype(str).str.contains("ETF|ETN|權證|指數|債", case=False, na=False)]
-    return d, warnings
-
-
-def merge_today_bar(h, z):
-    """
-    Yahoo 日K有時盤中/盤後尚未包含今天。
-    用 TWSE/TPEx 官方今日快照補上今天，避免分類仍在看昨天。
-    """
-    if h is None or h.empty:
-        return h
-    try:
-        d = h.copy()
-        today = pd.Timestamp.now(tz="Asia/Taipei").tz_localize(None).normalize()
-
-        close = float(z.close) if finite(z.close) else np.nan
-        if not finite(close):
-            return d
-
-        prev_close = close - float(z.change) if finite(z.change) else close
-        opn = float(z.open_today) if hasattr(z, "open_today") and finite(z.open_today) else prev_close
-        high = float(z.high_today) if hasattr(z, "high_today") and finite(z.high_today) else max(opn, close)
-        low = float(z.low_today) if hasattr(z, "low_today") and finite(z.low_today) else min(opn, close)
-        vol = float(z.volume) if finite(z.volume) else 0.0
-
-        bar = {
-            "date": today,
-            "open": opn,
-            "max": high,
-            "min": low,
-            "close": close,
-            "volume": vol,
-        }
-
-        d["date"] = pd.to_datetime(d["date"], errors="coerce")
-        same = d["date"].dt.normalize() == today
-        if same.any():
-            for k,v in bar.items():
-                d.loc[same, k] = v
-        else:
-            d = pd.concat([d, pd.DataFrame([bar])], ignore_index=True)
-
-        return d.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
-    except Exception:
-        return h
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def hist(code, market):
-    suffix = ".TW" if market == "上市" else ".TWO"
-    for host in YAHOO_HOSTS:
-        try:
-            url = f"{host}/{code}{suffix}"
-            r = requests.get(
-                url,
-                params={"range":"1y","interval":"1d","includePrePost":"false"},
-                headers=HEAD,
-                timeout=20
-            )
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            result = j.get("chart", {}).get("result")
-            if not result:
-                continue
-
-            z = result[0]
-            ts = z.get("timestamp") or []
-            quote = (z.get("indicators", {}).get("quote") or [{}])[0]
-            if len(ts) < 65:
-                continue
-
-            L = len(ts)
-            def arr(k):
-                a = quote.get(k) or []
-                return (a + [None] * L)[:L]
-
-            d = pd.DataFrame({
-                "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert("Asia/Taipei").tz_localize(None),
-                "open": arr("open"),
-                "max": arr("high"),
-                "min": arr("low"),
-                "close": arr("close"),
-                "volume": arr("volume"),
-            })
-            for c in ["open","max","min","close","volume"]:
-                d[c] = pd.to_numeric(d[c], errors="coerce")
-            d = d.dropna(subset=["open","max","min","close"]).sort_values("date").reset_index(drop=True)
-            if len(d) >= 65:
-                return d
-        except:
-            continue
-    return pd.DataFrame()
+def is_stock_code(x):
+    s = str(x).strip()
+    return bool(re.fullmatch(r"\d{4}", s))
 
 def pct(a, b):
-    if not finite(a) or not finite(b) or float(b) == 0:
+    if pd.isna(a) or pd.isna(b) or b == 0:
         return np.nan
-    return (float(a) / float(b) - 1) * 100
+    return (a / b - 1.0) * 100.0
 
-def rsi(s, n=14):
-    z = s.diff()
-    gain = z.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    loss = (-z.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    return 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+def fmt(v, digits=2, suffix=""):
+    if pd.isna(v):
+        return "NA"
+    return f"{v:,.{digits}f}{suffix}"
 
-def slope_pct(s, n):
-    y = pd.to_numeric(s, errors="coerce").dropna().tail(n).to_numpy(dtype=float)
-    if len(y) < n or np.nanmean(y) == 0:
-        return np.nan
-    return float(np.polyfit(np.arange(n), y, 1)[0] / np.nanmean(y) * 100)
+def yn(ok):
+    if pd.isna(ok):
+        return "⚪"
+    return "✅" if bool(ok) else "❌"
 
-def slope_label(x):
-    if not finite(x): return "-"
-    x = float(x)
-    if x >= .7: return "↑ 加速上揚"
-    if x >= .12: return "↗ 緩升"
-    if x <= -.7: return "↓ 加速下彎"
-    if x <= -.12: return "↘ 緩跌"
-    return "→ 走平"
+def http_json(url, params=None, retries=3):
+    last = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(0.8 * (i + 1))
+    raise RuntimeError(f"抓取失敗：{url} | {last}")
 
-def analyze(raw):
+# ---------------------------
+# TWSE / TPEx 日行情
+# ---------------------------
+
+@st.cache_data(ttl=60*60*12, show_spinner=False)
+def fetch_twse_day(d: str):
+    """d = YYYYMMDD"""
     try:
-        if raw is None or len(raw) < 65:
+        js = http_json(TWSE_DAY, {"response": "json", "date": d, "type": "ALLBUT0999"})
+        if js.get("stat") not in {"OK", "很抱歉，沒有符合條件的資料!"}:
+            return pd.DataFrame()
+        tables = js.get("tables", [])
+        target = None
+        for t in tables:
+            fields = t.get("fields", [])
+            if "證券代號" in fields and "收盤價" in fields and "成交股數" in fields:
+                target = t
+                break
+        # 舊版 schema fallback
+        if target is None:
+            for i in range(1, 20):
+                fields = js.get(f"fields{i}", [])
+                data = js.get(f"data{i}", [])
+                if "證券代號" in fields and "收盤價" in fields and "成交股數" in fields:
+                    target = {"fields": fields, "data": data}
+                    break
+        if target is None:
+            return pd.DataFrame()
+
+        raw = pd.DataFrame(target["data"], columns=target["fields"])
+        out = pd.DataFrame({
+            "date": pd.to_datetime(d),
+            "stock_id": raw["證券代號"].astype(str).str.strip(),
+            "name": raw["證券名稱"].astype(str).str.strip(),
+            "market": "TWSE",
+            "volume_shares": raw["成交股數"].map(safe_num),
+            "open": raw["開盤價"].map(safe_num),
+            "high": raw["最高價"].map(safe_num),
+            "low": raw["最低價"].map(safe_num),
+            "close": raw["收盤價"].map(safe_num),
+        })
+        out = out[out["stock_id"].map(is_stock_code)]
+        out = out[out["close"].notna() & (out["close"] > 0)]
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=60*60*12, show_spinner=False)
+def fetch_tpex_day(d_iso: str):
+    """d_iso = YYYY/MM/DD"""
+    try:
+        js = http_json(TPEX_DAY, {"response": "json", "date": d_iso})
+        # 2024+ 常見 schema: tables[0]
+        tables = js.get("tables", [])
+        target = None
+        for t in tables:
+            fields = t.get("fields", [])
+            # 欄名可能為「代號」或「證券代號」
+            if any("代號" in str(x) for x in fields) and any("收盤" in str(x) for x in fields):
+                target = t
+                break
+        # fallback: aaData + fields
+        if target is None and js.get("aaData"):
+            fields = js.get("fields") or js.get("columnNames") or []
+            if fields:
+                target = {"fields": fields, "data": js["aaData"]}
+        if target is None:
+            return pd.DataFrame()
+
+        raw = pd.DataFrame(target["data"], columns=target["fields"])
+        def col_like(words):
+            for c in raw.columns:
+                cs = str(c)
+                if all(w in cs for w in words):
+                    return c
             return None
 
-        d = raw.copy()
-        for k in [5,10,20,60,120,240]:
-            d[f"ma{k}"] = d["close"].rolling(k).mean()
+        c_id = col_like(["代號"]) or raw.columns[0]
+        c_name = col_like(["名稱"])
+        c_close = col_like(["收盤"])
+        c_open = col_like(["開盤"])
+        c_high = col_like(["最高"])
+        c_low = col_like(["最低"])
+        c_vol = col_like(["成交", "股"]) or col_like(["成交", "量"])
 
-        d["v20"] = d["volume"].rolling(20).mean()
-        d["vr"] = d["volume"] / d["v20"].replace(0, np.nan)
-        d["rsi"] = rsi(d["close"])
-
-        e12 = d["close"].ewm(span=12, adjust=False).mean()
-        e26 = d["close"].ewm(span=26, adjust=False).mean()
-        d["macd"] = e12 - e26
-        d["signal"] = d["macd"].ewm(span=9, adjust=False).mean()
-        d["hist"] = d["macd"] - d["signal"]
-
-        lo = d["min"].rolling(9).min()
-        hi = d["max"].rolling(9).max()
-        raw_k = (d["close"] - lo) / (hi - lo).replace(0, np.nan) * 100
-        d["k"] = raw_k.ewm(alpha=1/3, adjust=False).mean()
-        d["kd"] = d["k"].ewm(alpha=1/3, adjust=False).mean()
-
-        x = d.iloc[-1]
-        c = float(x["close"])
-        ma5, ma10, ma20, ma60 = x["ma5"], x["ma10"], x["ma20"], x["ma60"]
-        b5, b20, b60 = pct(c, ma5), pct(c, ma20), pct(c, ma60)
-        s5 = slope_pct(d["ma5"], 5)
-        s20 = slope_pct(d["ma20"], 10)
-        s60 = slope_pct(d["ma60"], 15)
-
-        vals = []
-        for k in [5,10,20,60,120,240]:
-            v = x[f"ma{k}"]
-            if finite(v): vals.append(float(v))
-        for k in [20,40,60]:
-            if len(d) >= k:
-                vals += [float(d["min"].tail(k).min()), float(d["max"].tail(k).max())]
-
-        supports = sorted({round(v,2) for v in vals if v < c*.998}, reverse=True)
-        resistances = sorted({round(v,2) for v in vals if v > c*1.002})
-        support = supports[0] if supports else np.nan
-        support2 = supports[1] if len(supports) > 1 else np.nan
-        resistance = resistances[0] if resistances else np.nan
-        resistance2 = resistances[1] if len(resistances) > 1 else np.nan
-        rr = ((resistance-c)/(c-support)
-              if finite(support) and finite(resistance) and c > float(support) else np.nan)
-
-        hi20 = float(d["max"].tail(20).max())
-        lo20 = float(d["min"].tail(20).min())
-        hi40 = float(d["max"].tail(40).max())
-        r40 = pct(c, d["close"].iloc[-41])
-        from_hi = pct(c, hi40)
-        vr = float(x["vr"]) if finite(x["vr"]) else 0.0
-        rsi_now = float(x["rsi"]) if finite(x["rsi"]) else 50.0
-        k_now = float(x["k"]) if finite(x["k"]) else 50.0
-        d_now = float(x["kd"]) if finite(x["kd"]) else 50.0
-        hist_now = float(x["hist"]) if finite(x["hist"]) else 0.0
-        hist_prev = float(d["hist"].iloc[-2]) if finite(d["hist"].iloc[-2]) else 0.0
-
-        if c >= hi20*.995 and vr >= 1.3:
-            pattern = "平台突破"
-        elif lo20 > 0 and (hi20-lo20)/lo20 < .10:
-            pattern = "箱型整理"
-        elif finite(r40) and r40 > 25 and c < hi40*.98 and gt(c, ma20):
-            pattern = "強勢股拉回"
-        elif finite(r40) and r40 < 0 and gt(c, ma20) and vr >= 1.5:
-            pattern = "跌深轉折"
-        elif gt(ma5, ma10) and gt(ma10, ma20):
-            pattern = "多頭排列"
-        else:
-            pattern = "整理觀察"
-
-        score = 50
-        checks = [
-            (gt(c, ma5), 5),
-            (gt(c, ma20), 10),
-            (gt(c, ma60), 5),
-            (gt(ma5, ma10) and gt(ma10, ma20), 10),
-            (finite(s20) and s20 > .12, 8),
-            (vr >= 1.3, 6),
-            (hist_now > hist_prev, 6),
-        ]
-        for ok, pts in checks:
-            if ok:
-                score += pts
-
-        # 風險係數 0~100：波動度30% + 20日最大回撤25% + 量能穩定20% + 訊號一致性25%
-        prev_close = d["close"].shift(1)
-        tr = pd.concat([
-            d["max"]-d["min"],
-            (d["max"]-prev_close).abs(),
-            (d["min"]-prev_close).abs()
-        ], axis=1).max(axis=1)
-        atr14 = tr.rolling(14).mean().iloc[-1]
-        atr_pct = float(atr14/c*100) if finite(atr14) and c else np.nan
-
-        peak20 = d["close"].tail(20).cummax()
-        dd20_series = (d["close"].tail(20)/peak20-1)*100
-        max_dd20 = abs(float(dd20_series.min())) if not dd20_series.dropna().empty else np.nan
-
-        vol20 = pd.to_numeric(d["volume"].tail(20),errors="coerce").dropna()
-        vol_cv = float(vol20.std()/vol20.mean()) if len(vol20)>=5 and vol20.mean()>0 else np.nan
-
-        signal_checks = [
-            gt(c,ma20), gt(c,ma60), gt(ma5,ma10), gt(ma10,ma20),
-            finite(s20) and s20>0, hist_now>0, rsi_now>=50
-        ]
-        consistency = sum(bool(v) for v in signal_checks)/len(signal_checks)
-
-        risk_vol = min(30, max(0, (atr_pct if finite(atr_pct) else 3.0)/6.0*30))
-        risk_dd = min(25, max(0, (max_dd20 if finite(max_dd20) else 10.0)/20.0*25))
-        risk_volume = min(20, max(0, (vol_cv if finite(vol_cv) else .6)/1.2*20))
-        risk_signal = max(0, (1-consistency)*25)
-        risk = int(round(min(100, risk_vol+risk_dd+risk_volume+risk_signal)))
-
-        # 賊大 8 大選股分類（資金生命週期）
-        # 這裡只做「價格 / 成交量 / 均線」階段判讀。
-        # ⑤基本面、⑥/⑧融券確認會在外部資料抓回後再補強。
-        zeida_tags = []
-
-        day_chg = pct(c, d["close"].iloc[-2]) if len(d) >= 2 else np.nan
-        r20_now = pct(c, d["close"].iloc[-21]) if len(d) > 21 else np.nan
-        bias20_now = pct(c, ma20)
-        bias60_now = pct(c, ma60)
-        range20 = ((hi20 - lo20) / lo20 * 100) if lo20 > 0 else np.nan
-
-        hi60 = float(d["max"].tail(min(60,len(d))).max())
-        lo60 = float(d["min"].tail(min(60,len(d))).min())
-        r60 = pct(c, d["close"].iloc[-61]) if len(d) > 61 else np.nan
-        from_hi60 = pct(c, hi60) if finite(hi60) else np.nan
-
-        ma5_series = d["close"].rolling(5).mean()
-        prev5_below = False
-        if len(d) >= 6:
-            _recent_close = d["close"].iloc[-6:-1]
-            _recent_ma5 = ma5_series.iloc[-6:-1]
-            prev5_below = bool((_recent_close < _recent_ma5).fillna(False).any())
-        reclaimed_ma5 = prev5_below and gt(c, ma5)
-
-        # ⑦ 跌深轉折：先要求真的「跌深」，避免一般整理誤判成底部反轉。
-        deep_decline = (
-            (finite(r60) and r60 <= -20)
-            or (finite(from_hi60) and from_hi60 <= -25)
-        )
-        near_ma20_after_turn = (
-            finite(bias20_now)
-            and -3 <= bias20_now <= 10
-        )
-        if (
-            deep_decline
-            and gt(c, ma20)
-            and near_ma20_after_turn
-            and vr >= 1.60
-            and hist_now >= hist_prev
-            and (not finite(day_chg) or day_chg > 0)
-        ):
-            zeida_tags.append("⑦跌深轉折")
-
-        # ② 盤整待突破：真的要有一段橫盤，且尚未進入大漲狀態。
-        long_base = (
-            finite(range20) and range20 <= 15
-            and finite(r20_now) and abs(r20_now) <= 12
-            and finite(bias20_now) and abs(bias20_now) <= 8
-        )
-        if (
-            long_base
-            and c >= hi20 * .955
-            and 0.90 <= vr <= 2.00
-            and not (finite(day_chg) and day_chg >= 6)
-        ):
-            zeida_tags.append("②盤整待突破")
-
-        # ⑧ 整理轉強：站上中期均線、整理收斂、剛開始轉強，不能已噴出。
-        not_extended = (
-            finite(r40) and r40 < 20
-            and finite(r20_now) and r20_now < 12
-            and finite(bias20_now) and bias20_now < 7
-            and finite(bias60_now) and bias60_now < 12
-        )
-        still_consolidating = finite(range20) and range20 <= 16
-        if (
-            gt(c, ma60) and gt(c, ma20)
-            and finite(s20) and s20 > 0
-            and not_extended and still_consolidating
-            and 0.90 <= vr < 1.70
-            and not (finite(day_chg) and day_chg >= 6)
-        ):
-            zeida_tags.append("⑧整理轉強")
-
-        # ③ 剛起動：前面漲幅不能大，現在才第一次放量攻擊。
-        prior20_ret = pct(d["close"].iloc[-2], d["close"].iloc[-22]) if len(d) > 22 else np.nan
-
-        # 近5日若已經出現2根以上「大漲K」，視為已經發動一段，不再算③第一次發動。
-        _chg5 = d["close"].pct_change() * 100
-        big_up_count_5 = int((_chg5.tail(5) >= 5).sum())
-
-        first_launch = (
-            finite(prior20_ret) and prior20_ret < 12
-            and finite(r40) and r40 < 22
-            and big_up_count_5 <= 1
-            and vr >= 1.35
-            and c >= hi20 * .97
-            and (not finite(day_chg) or day_chg >= 1.5)
-        )
-        if first_launch:
-            zeida_tags.append("③剛起動")
-
-        # ②/③ 接近成立候選：差一點點時也保留觀察，不與正式成立混淆。
-        near_tags = []
-
-        near_2 = (
-            finite(range20) and range20 <= 18
-            and finite(r20_now) and abs(r20_now) <= 15
-            and finite(bias20_now) and abs(bias20_now) <= 10
-            and c >= hi20 * .94
-            and 0.80 <= vr <= 2.20
-            and not (finite(day_chg) and day_chg >= 7)
-            and "②盤整待突破" not in zeida_tags
-        )
-        if near_2:
-            near_tags.append("②接近突破")
-
-        near_3 = (
-            finite(prior20_ret) and prior20_ret < 15
-            and finite(r40) and r40 < 25
-            and big_up_count_5 <= 1
-            and vr >= 1.20
-            and c >= hi20 * .95
-            and (not finite(day_chg) or day_chg >= 1.0)
-            and "③剛起動" not in zeida_tags
-        )
-        if near_3:
-            near_tags.append("③接近起動")
-
-        # ① 強勢熱門：已形成短中期多頭，但不要離20MA過遠，避免把噴出段仍當「初期」。
-        if (
-            gt(ma5, ma10) and gt(ma10, ma20) and gt(c, ma20)
-            and finite(r20_now) and 5 <= r20_now <= 28
-            and finite(bias20_now) and bias20_now <= 12
-            and vr >= 1.15 and c >= hi20 * .95
-        ):
-            zeida_tags.append("①強勢熱門")
-
-        # ④ 強勢股拉回：前40日已漲一大段，近期曾跌破5MA，現在處於洗盤/重新站回階段。
-        if (
-            finite(r40) and r40 >= 28
-            and finite(from_hi) and -16 <= from_hi <= -2
-            and gt(c, ma20)
-            and vr <= 1.55
-            and (prev5_below or reclaimed_ma5 or (finite(b5) and -4 <= b5 <= 4))
-        ):
-            zeida_tags.append("④強勢股拉回")
-
-        # ⑥ 強勢噴出：已脫離整理區、逼近40日高，避免再歸到⑧。
-        if (
-            finite(r40) and r40 >= 25
-            and c >= hi40 * .98
-            and (
-                vr >= 1.25
-                or (finite(bias20_now) and bias20_now >= 12)
-                or (finite(day_chg) and day_chg >= 6)
-            )
-        ):
-            zeida_tags.append("⑥強勢噴出")
-
-        # 同一檔可有次要標籤，但「主階段」採優先順序避免 3450 類型被前面的①/⑧蓋掉。
-        primary_priority = [
-            "⑥強勢噴出",
-            "④強勢股拉回",
-            "③剛起動",
-            "⑦跌深轉折",
-            "①強勢熱門",
-            "⑧整理轉強",
-            "②盤整待突破",
-        ]
-        primary_stage = next((x for x in primary_priority if x in zeida_tags), None)
-
-        cond = primary_stage if primary_stage else ("①強勢觀察" if gt(c, ma20) else "整理觀察")
-
-        return {
-            "score": int(max(0,min(100,round(score-risk*.1)))),
-            "risk": min(100,risk),
-            "pattern": pattern,
-            "condition": cond,
-            "zeida_tags": zeida_tags,
-            "near_tags": near_tags,
-            "primary_stage": primary_stage,
-            "bias5": b5, "bias20": b20, "bias60": b60,
-            "s5": s5, "s20": s20, "s60": s60,
-            "support": support, "support2": support2,
-            "resistance": resistance, "resistance2": resistance2, "rr": rr,
-            "rsi": rsi_now, "k": k_now, "d": d_now, "vr": vr,
-            "r20": pct(c, d["close"].iloc[-21]) if len(d) > 21 else np.nan,
-            "ma60_up": gt(c, ma60),
-            "macd_positive": hist_now > 0,
-            "kd_golden": k_now > d_now,
-            "atr_pct": atr_pct,
-            "max_dd20": max_dd20,
-            "vol_cv": vol_cv,
-            "signal_consistency": consistency*100,
-            "data": d
-        }
-    except Exception:
-        return None
-
-def chart(d, code, name):
-    q = d.tail(140)
-    fig = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.75,.25],vertical_spacing=.03)
-    fig.add_trace(go.Candlestick(
-        x=q["date"],open=q["open"],high=q["max"],low=q["min"],close=q["close"],name="K線"
-    ),1,1)
-    for k in [5,10,20,60]:
-        fig.add_trace(go.Scatter(x=q["date"],y=q[f"ma{k}"],name=f"MA{k}",line=dict(width=1)),1,1)
-    fig.add_trace(go.Bar(x=q["date"],y=q["volume"],name="成交量"),2,1)
-    fig.update_layout(template="plotly_dark",height=600,title=f"{code} {name}",xaxis_rangeslider_visible=False)
-    return fig
-
-
-FINMIND = "https://api.finmindtrade.com/api/v4/data"
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def institutional_5d(code):
-    try:
-        end = pd.Timestamp.today().date()
-        start = end - pd.Timedelta(days=35)
-        r = requests.get(
-            FINMIND,
-            params={
-                "dataset":"TaiwanStockInstitutionalInvestorsBuySellWide",
-                "data_id":str(code),
-                "start_date":str(start),
-                "end_date":str(end),
-            },
-            headers=HEAD,
-            timeout=18
-        )
-        if r.status_code != 200:
-            return 0.0
-        j = r.json()
-        if j.get("status") not in (200, None):
-            return 0.0
-        d = pd.DataFrame(j.get("data", []))
-        if d.empty:
-            return 0.0
-        d = d.tail(5).copy()
-        total = 0.0
-        pairs = [
-            ("Foreign_Investor_buy","Foreign_Investor_sell"),
-            ("Investment_Trust_buy","Investment_Trust_sell"),
-            ("Dealer_self_buy","Dealer_self_sell"),
-            ("Dealer_Hedging_buy","Dealer_Hedging_sell"),
-        ]
-        used = False
-        for b,s in pairs:
-            if b in d.columns and s in d.columns:
-                total += (
-                    pd.to_numeric(d[b],errors="coerce").fillna(0)
-                    - pd.to_numeric(d[s],errors="coerce").fillna(0)
-                ).sum()
-                used = True
-        return float(total) if used else 0.0
-    except:
-        return 0.0
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def finmind_dataset(dataset, code, start_days=500):
-    """FinMind 安全讀取器：失敗就回空表，不讓整個 App 掛掉。"""
-    try:
-        end = pd.Timestamp.today().date()
-        start = end - pd.Timedelta(days=start_days)
-        r = requests.get(
-            FINMIND,
-            params={
-                "dataset": dataset,
-                "data_id": str(code),
-                "start_date": str(start),
-                "end_date": str(end),
-            },
-            headers=HEAD,
-            timeout=18,
-        )
-        if r.status_code != 200:
+        if c_close is None or c_vol is None:
             return pd.DataFrame()
-        j = r.json()
-        if j.get("status") not in (200, None):
-            return pd.DataFrame()
-        return pd.DataFrame(j.get("data", []))
+
+        out = pd.DataFrame({
+            "date": pd.to_datetime(d_iso.replace("/", "-")),
+            "stock_id": raw[c_id].astype(str).str.strip(),
+            "name": raw[c_name].astype(str).str.strip() if c_name else "",
+            "market": "TPEx",
+            "volume_shares": raw[c_vol].map(safe_num),
+            "open": raw[c_open].map(safe_num) if c_open else np.nan,
+            "high": raw[c_high].map(safe_num) if c_high else np.nan,
+            "low": raw[c_low].map(safe_num) if c_low else np.nan,
+            "close": raw[c_close].map(safe_num),
+        })
+        # 某些舊端點成交量是「張」；用欄名判斷
+        if c_vol and ("仟" in str(c_vol) or "千股" in str(c_vol) or "張" in str(c_vol)):
+            out["volume_shares"] = out["volume_shares"] * 1000.0
+
+        out = out[out["stock_id"].map(is_stock_code)]
+        out = out[out["close"].notna() & (out["close"] > 0)]
+        return out
     except Exception:
         return pd.DataFrame()
 
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def chip_detail_5d(code):
-    """外資 / 投信 / 自營商近5日買賣超。"""
-    d = finmind_dataset("TaiwanStockInstitutionalInvestorsBuySellWide", code, 45)
-    out = {"foreign":0.0, "trust":0.0, "dealer":0.0, "total":0.0}
-    if d.empty:
-        return out
-    d = d.tail(5).copy()
-
-    def net(buy_col, sell_col):
-        if buy_col not in d.columns or sell_col not in d.columns:
-            return 0.0
-        return float(
-            (
-                pd.to_numeric(d[buy_col], errors="coerce").fillna(0)
-                - pd.to_numeric(d[sell_col], errors="coerce").fillna(0)
-            ).sum()
-        )
-
-    out["foreign"] = net("Foreign_Investor_buy","Foreign_Investor_sell")
-    out["trust"] = net("Investment_Trust_buy","Investment_Trust_sell")
-    out["dealer"] = (
-        net("Dealer_self_buy","Dealer_self_sell")
-        + net("Dealer_Hedging_buy","Dealer_Hedging_sell")
-    )
-    out["total"] = out["foreign"] + out["trust"] + out["dealer"]
-    return out
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def short_interest_5d(code):
-    """融券餘額與近5日變化；欄位不存在時安全回傳空值。"""
-    d = finmind_dataset("TaiwanStockMarginPurchaseShortSale", code, 60)
-    if d.empty:
-        return {"balance":np.nan, "change5":np.nan}
-    # FinMind 常見欄位名稱；同時做多個候選欄位相容。
-    balance_cols = [
-        "ShortSaleTodayBalance",
-        "ShortSaleBalance",
-        "short_sale_balance",
-        "short_balance",
-    ]
-    bal_col = next((c for c in balance_cols if c in d.columns), None)
-    if bal_col is None:
-        return {"balance":np.nan, "change5":np.nan}
-    s = pd.to_numeric(d[bal_col], errors="coerce").dropna()
-    if s.empty:
-        return {"balance":np.nan, "change5":np.nan}
-    now = float(s.iloc[-1])
-    prev = float(s.iloc[-6]) if len(s) >= 6 else float(s.iloc[0])
-    return {"balance":now, "change5":now-prev}
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fundamental_growth(code):
-    """
-    條件⑤：營運成長潛力。
-    優先看月營收 YoY + 最近EPS；資料不足時降低信心，不硬造數字。
-    """
-    out = {
-        "revenue_yoy":np.nan, "revenue_3m_yoy":np.nan,
-        "eps":np.nan, "eps_prev":np.nan, "eps_growth":np.nan,
-        "eps_3q_sum":np.nan, "revenue_record_high":False,
-        "pass":False, "confidence":"低", "note":"基本面資料不足"
-    }
-
-    rev = finmind_dataset("TaiwanStockMonthRevenue", code, 900)
-    if not rev.empty and "revenue" in rev.columns:
-        r = rev.copy()
-        r["revenue"] = pd.to_numeric(r["revenue"], errors="coerce")
-        if "date" in r.columns:
-            r["date"] = pd.to_datetime(r["date"], errors="coerce")
-            r = r.sort_values("date")
-        r = r.dropna(subset=["revenue"]).tail(30).reset_index(drop=True)
-
-        yoy_list = []
-        if "revenue_year" in r.columns and "revenue_month" in r.columns:
-            r["revenue_year"] = pd.to_numeric(r["revenue_year"], errors="coerce")
-            r["revenue_month"] = pd.to_numeric(r["revenue_month"], errors="coerce")
-            lookup = {
-                (int(y),int(m)):float(v)
-                for y,m,v in zip(r["revenue_year"],r["revenue_month"],r["revenue"])
-                if finite(y) and finite(m) and finite(v)
-            }
-            for y,m,v in zip(r["revenue_year"],r["revenue_month"],r["revenue"]):
-                if not (finite(y) and finite(m) and finite(v)):
-                    yoy_list.append(np.nan); continue
-                pv = lookup.get((int(y)-1,int(m)))
-                yoy_list.append(((float(v)/pv)-1)*100 if pv not in (None,0) else np.nan)
-        else:
-            # 如果只有日期，按年月做同月去年比較
-            if "date" in r.columns:
-                lookup = {(x.year,x.month):float(v) for x,v in zip(r["date"],r["revenue"]) if pd.notna(x) and finite(v)}
-                for x,v in zip(r["date"],r["revenue"]):
-                    pv = lookup.get((x.year-1,x.month)) if pd.notna(x) else None
-                    yoy_list.append(((float(v)/pv)-1)*100 if pv not in (None,0) else np.nan)
-
-        if yoy_list:
-            r["yoy"] = yoy_list
-            ys = pd.to_numeric(r["yoy"], errors="coerce").dropna()
-            if not ys.empty:
-                out["revenue_yoy"] = float(ys.iloc[-1])
-                out["revenue_3m_yoy"] = float(ys.tail(3).mean())
-
-        # 最近一個月營收是否創目前可取得資料的歷史新高
-        _rv = pd.to_numeric(r["revenue"], errors="coerce").dropna()
-        if len(_rv) >= 12:
-            out["revenue_record_high"] = bool(float(_rv.iloc[-1]) >= float(_rv.max()))
-
-    fs = finmind_dataset("TaiwanStockFinancialStatements", code, 1200)
-    if not fs.empty:
-        # 兼容 type / origin_name / name 等不同欄位
-        text_cols = [c for c in ["type","origin_name","name","item"] if c in fs.columns]
-        val_col = next((c for c in ["value","amount"] if c in fs.columns), None)
-        if text_cols and val_col:
-            mask = pd.Series(False, index=fs.index)
-            for c in text_cols:
-                txt = fs[c].astype(str)
-                mask = mask | txt.str.contains("EPS|EarningsPerShare|每股盈餘", case=False, regex=True, na=False)
-            e = fs.loc[mask].copy()
-            if "date" in e.columns:
-                e["date"] = pd.to_datetime(e["date"], errors="coerce")
-                e = e.sort_values("date")
-            ev = pd.to_numeric(e[val_col], errors="coerce").dropna()
-            if len(ev) >= 1:
-                out["eps"] = float(ev.iloc[-1])
-            if len(ev) >= 2:
-                out["eps_prev"] = float(ev.iloc[-2])
-                if out["eps_prev"] != 0:
-                    out["eps_growth"] = (out["eps"]/out["eps_prev"]-1)*100
-            if len(ev) >= 3:
-                out["eps_3q_sum"] = float(ev.tail(3).sum())
-
-    rev_ok = finite(out["revenue_yoy"]) and finite(out["revenue_3m_yoy"]) and out["revenue_yoy"] >= 10 and out["revenue_3m_yoy"] >= 10
-    eps_known = finite(out["eps"])
-    eps_ok = eps_known and out["eps"] > 0 and (not finite(out["eps_growth"]) or out["eps_growth"] >= 0)
-
-    if rev_ok and eps_ok:
-        out["pass"] = True
-        out["confidence"] = "高"
-        out["note"] = "營收YoY與EPS同向成長"
-    elif rev_ok and not eps_known and out["revenue_yoy"] >= 15 and out["revenue_3m_yoy"] >= 15:
-        out["pass"] = True
-        out["confidence"] = "中"
-        out["note"] = "營收成長強，但EPS資料暫未取得"
-    elif rev_ok:
-        out["confidence"] = "中"
-        out["note"] = "營收成長，EPS尚未同步確認"
-
-    return out
-
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def capital_profile(code, close=np.nan):
-    """
-    嘗試從 FinMind 資產負債表取得股本。
-    資料抓不到就回 unknown，不用猜。
-    """
-    out = {
-        "capital": np.nan,      # 元
-        "shares": np.nan,       # 股，若可由股本/10估算
-        "market_cap": np.nan,   # 元
-        "small_cap": None,
-        "confidence": "低",
-    }
-    try:
-        d = finmind_dataset("TaiwanStockBalanceSheet", code, 1400)
-        if d.empty:
-            return out
-
-        text_cols = [c for c in ["type","origin_name","name","item"] if c in d.columns]
-        val_col = next((c for c in ["value","amount"] if c in d.columns), None)
-        if not text_cols or val_col is None:
-            return out
-
-        mask = pd.Series(False, index=d.index)
-        for c in text_cols:
-            t = d[c].astype(str)
-            mask = mask | t.str.contains(
-                "CapitalStock|ShareCapital|股本|普通股股本",
-                case=False, regex=True, na=False
-            )
-
-        z = d.loc[mask].copy()
-        if z.empty:
-            return out
-        if "date" in z.columns:
-            z["date"] = pd.to_datetime(z["date"], errors="coerce")
-            z = z.sort_values("date")
-
-        vals = pd.to_numeric(z[val_col], errors="coerce").dropna()
-        if vals.empty:
-            return out
-
-        capital = float(vals.iloc[-1])
-        # 台股面額通常10元；只用於估算分類，資料來源無法確認時不做硬排除。
-        shares = capital / 10.0 if capital > 0 else np.nan
-        mcap = shares * float(close) if finite(shares) and finite(close) else np.nan
-
-        out.update({
-            "capital": capital,
-            "shares": shares,
-            "market_cap": mcap,
-            # 圖中只說「股本小」，沒有指定門檻；這裡用 50 億元以下作加分，不作必要條件。
-            "small_cap": bool(capital <= 5_000_000_000) if finite(capital) else None,
-            "confidence": "中",
-        })
-        return out
-    except Exception:
-        return out
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def chip_trend_10d(code):
-    """
-    近3/5/10日法人方向 + 連續買超天數。
-    用來補原圖中的「法人動向 / 法人續買 / 法人開始布局」。
-    """
-    d = finmind_dataset("TaiwanStockInstitutionalInvestorsBuySellWide", code, 60)
-    out = {
-        "foreign3":0.0, "foreign5":0.0, "foreign10":0.0,
-        "trust3":0.0, "trust5":0.0, "trust10":0.0,
-        "total3":0.0, "total5":0.0, "total10":0.0,
-        "positive_days5":0, "foreign_positive_days5":0,
-        "available":False,
-    }
-    if d.empty:
-        return out
-
-    def daily_net(frame, buy_col, sell_col):
-        if buy_col not in frame.columns or sell_col not in frame.columns:
-            return pd.Series(0.0, index=frame.index)
-        return (
-            pd.to_numeric(frame[buy_col], errors="coerce").fillna(0)
-            - pd.to_numeric(frame[sell_col], errors="coerce").fillna(0)
-        )
-
-    d = d.tail(10).copy()
-    foreign = daily_net(d, "Foreign_Investor_buy","Foreign_Investor_sell")
-    trust = daily_net(d, "Investment_Trust_buy","Investment_Trust_sell")
-    dealer = (
-        daily_net(d, "Dealer_self_buy","Dealer_self_sell")
-        + daily_net(d, "Dealer_Hedging_buy","Dealer_Hedging_sell")
-    )
-    total = foreign + trust + dealer
-
-    def tail_sum(s, n): return float(s.tail(n).sum())
-
-    out.update({
-        "foreign3":tail_sum(foreign,3),
-        "foreign5":tail_sum(foreign,5),
-        "foreign10":tail_sum(foreign,10),
-        "trust3":tail_sum(trust,3),
-        "trust5":tail_sum(trust,5),
-        "trust10":tail_sum(trust,10),
-        "total3":tail_sum(total,3),
-        "total5":tail_sum(total,5),
-        "total10":tail_sum(total,10),
-        "positive_days5":int((total.tail(5)>0).sum()),
-        "foreign_positive_days5":int((foreign.tail(5)>0).sum()),
-        "available":True,
-    })
-    return out
-
-
-def _score_bool(ok, pts):
-    return pts if bool(ok) else 0
-
-
-
-def market_regime_score(index_df):
-    """
-    用大盤 20/60MA、20日漲幅、20日波動判定市場環境。
-    只做多方選股風險調整，不把大盤當成絕對買賣訊號。
-    """
-    out = {"score":50, "label":"中性", "detail":"大盤資料不足"}
-    if index_df is None or index_df.empty or len(index_df) < 65:
-        return out
-    d = index_df.copy()
-    d["ma20"] = d["close"].rolling(20).mean()
-    d["ma60"] = d["close"].rolling(60).mean()
-    c = float(d["close"].iloc[-1])
-    ma20 = float(d["ma20"].iloc[-1])
-    ma60 = float(d["ma60"].iloc[-1])
-    r20 = (c/float(d["close"].iloc[-21])-1)*100
-    vol20 = float(d["close"].pct_change().tail(20).std()*100)
-
-    score = 50
-    score += 15 if c > ma20 else -15
-    score += 15 if c > ma60 else -15
-    score += 10 if ma20 > ma60 else -10
-    score += 10 if r20 > 3 else -10 if r20 < -3 else 0
-    score += 5 if vol20 < 2.2 else -5 if vol20 > 3.5 else 0
-    score = int(max(0,min(100,score)))
-
-    label = "多頭" if score >= 70 else "偏多" if score >= 58 else "中性" if score >= 42 else "偏空" if score >= 30 else "空頭"
-    return {
-        "score":score, "label":label,
-        "detail":f"20MA/60MA與20日報酬綜合；20日波動 {vol20:.2f}%"
-    }
-
-
-def data_quality_score(a, fund, sh, cp, cap):
-    """
-    0~100 資料品質分數。
-    缺法人、融券、基本面、股本時，降低策略可信度，避免『缺資料卻高分』。
-    """
-    checks = {
-        "K線": bool(a and a.get("data") is not None and len(a.get("data")) >= 120),
-        "法人": bool(cp.get("available", False)),
-        "融券": finite(sh.get("balance")) or finite(sh.get("change5")),
-        "營收": finite(fund.get("revenue_yoy")),
-        "EPS": finite(fund.get("eps")),
-        "股本": finite(cap.get("capital")),
-    }
-    weights = {"K線":30,"法人":20,"融券":15,"營收":15,"EPS":10,"股本":10}
-    score = sum(weights[k] for k,v in checks.items() if v)
-    missing = [k for k,v in checks.items() if not v]
-    return {
-        "score":int(score),
-        "missing":missing,
-        "label":"高" if score>=85 else "中" if score>=65 else "低"
-    }
-
-
-
-def data_quality_breakdown(a, fund, sh, cp, cap):
-    """分項資料品質：未取得不視為0，而是降低品質分數。"""
-    result = {}
-
-    k_ok = bool(a and a.get("data") is not None and len(a.get("data")) >= 120)
-    result["K線"] = {
-        "score":100 if k_ok else 40 if a and a.get("data") is not None else 0,
-        "status":"✅" if k_ok else "⚠️" if a and a.get("data") is not None else "❌",
-        "detail":"歷史K線足夠" if k_ok else "歷史K線不足"
-    }
-
-    cp_ok = bool(cp.get("available", False))
-    cp_days = int(cp.get("positive_days5",0) or 0)
-    result["法人"] = {
-        "score":100 if cp_ok else 0,
-        "status":"✅" if cp_ok else "❌",
-        "detail":f"近5日正向 {cp_days} 天" if cp_ok else "法人資料未取得"
-    }
-
-    short_ok = finite(sh.get("balance")) or finite(sh.get("change5"))
-    result["融券"] = {
-        "score":100 if short_ok else 0,
-        "status":"✅" if short_ok else "❌",
-        "detail":f"5日變化 {sh.get('change5'):.0f}" if finite(sh.get("change5")) else "融券資料未取得"
-    }
-
-    rev_ok = finite(fund.get("revenue_yoy"))
-    result["營收"] = {
-        "score":100 if rev_ok else 0,
-        "status":"✅" if rev_ok else "❌",
-        "detail":f"YoY {fund.get('revenue_yoy'):.1f}%" if rev_ok else "營收資料未取得"
-    }
-
-    eps_ok = finite(fund.get("eps"))
-    result["EPS"] = {
-        "score":100 if eps_ok else 0,
-        "status":"✅" if eps_ok else "❌",
-        "detail":f"EPS {fund.get('eps'):.2f}" if eps_ok else "EPS資料未取得"
-    }
-
-    cap_ok = finite(cap.get("capital"))
-    result["股本"] = {
-        "score":100 if cap_ok else 0,
-        "status":"✅" if cap_ok else "❌",
-        "detail":f"{cap.get('capital')/1e8:.1f} 億" if cap_ok else "股本資料未取得"
-    }
-
-    weights = {"K線":30,"法人":20,"融券":15,"營收":15,"EPS":10,"股本":10}
-    overall = int(round(sum(result[k]["score"]*weights[k]/100 for k in weights)))
-    result["整體"] = {
-        "score":overall,
-        "status":"✅" if overall>=85 else "⚠️" if overall>=65 else "❌",
-        "detail":"高品質" if overall>=85 else "中等" if overall>=65 else "偏低"
-    }
-    return result
-
-
-
-def strategy_market_adjust(stage, market_score):
-    """
-    不同戰術對市場環境敏感度不同。
-    ①③⑥偏追趨勢，空頭環境扣分較大；④⑦較能容忍震盪；⑤較中性。
-    """
-    if not stage:
-        return 0
-    ms = float(market_score)
-    if stage in ["①強勢熱門","③剛起動","⑥強勢噴出"]:
-        return round((ms-50)*0.22,1)
-    if stage in ["②盤整待突破","⑧整理轉強"]:
-        return round((ms-50)*0.15,1)
-    if stage in ["④強勢股拉回"]:
-        return round((ms-50)*0.10,1)
-    if stage in ["⑦跌深轉折"]:
-        return round((50-ms)*0.05,1)
-    return round((ms-50)*0.05,1)
-
-
-def final_strategy_confidence(a, full_eval, quality, market):
-    """
-    最終可信度：戰術本身分數 + 資料品質 + 市場環境調整。
-    不是『未來上漲機率』，是『目前分類可信程度』。
-    """
-    stage = full_eval.get("primary")
-    if not stage:
-        return {"score":0,"label":"低","reason":"沒有正式成立的主階段"}
-
-    base = float(full_eval.get("scores",{}).get(stage,0))
-    q = float(quality.get("score",0))
-    adj = strategy_market_adjust(stage, market.get("score",50))
-    score = base*0.65 + q*0.25 + max(0,min(100,market.get("score",50)))*0.10 + adj
-    score = int(max(0,min(100,round(score))))
-
-    label = "高" if score>=82 else "中" if score>=70 else "低"
-    miss = "、".join(quality.get("missing",[])) if quality.get("missing") else "無"
-    return {
-        "score":score,
-        "label":label,
-        "reason":f"戰術{base:.0f} / 資料品質{q:.0f} / 大盤{market.get('label','中性')}；缺資料：{miss}"
-    }
-
-
-
-def _to_lots(v):
-    """
-    將股數轉成張數。FinMind 法人與 Yahoo volume 多數以股數計。
-    小於 100000 的數值若本身看起來像張數，仍保留原值，避免過度除1000。
-    """
-    if not finite(v):
-        return np.nan
-    v = float(v)
-    return v / 1000.0 if abs(v) >= 100000 else v
-
-
-def original_course_conditions(a, fund, cp, cap, close):
-    """
-    完全依使用者提供的課程截圖，把條件①～⑤的「數字規則」獨立計算。
-    這層不取代資金生命週期，而是與賊大①～⑧階段判讀交叉驗證。
-    """
-    d = a.get("data")
-    out = {}
-    if d is None or d.empty or len(d) < 45:
-        return out
-
-    c = float(close)
-    shares = cap.get("shares", np.nan)
-    capital = cap.get("capital", np.nan)
-
-    # 價格報酬
-    r10 = (c / float(d["close"].iloc[-11]) - 1) * 100 if len(d) > 11 else np.nan
-    r20 = (c / float(d["close"].iloc[-21]) - 1) * 100 if len(d) > 21 else np.nan
-    r30 = (c / float(d["close"].iloc[-31]) - 1) * 100 if len(d) > 31 else np.nan
-    r40 = (c / float(d["close"].iloc[-41]) - 1) * 100 if len(d) > 41 else np.nan
-
-    # 量能：今日 / 前5日均量（前5日不含今日，更符合「今日相對均量」）
-    vol = pd.to_numeric(d["volume"], errors="coerce")
-    today_vol = float(vol.iloc[-1]) if finite(vol.iloc[-1]) else np.nan
-    prev5_avg = float(vol.iloc[-6:-1].mean()) if len(vol) >= 6 else np.nan
-    vol_ratio5 = today_vol / prev5_avg if finite(today_vol) and finite(prev5_avg) and prev5_avg > 0 else np.nan
-
-    # 週轉率
-    turnover = today_vol / float(shares) * 100 if finite(today_vol) and finite(shares) and shares > 0 else np.nan
-
-    # 法人近10日（轉成張）
-    inst10_lots = _to_lots(cp.get("total10", np.nan))
-    inst10_sell_lots = -inst10_lots if finite(inst10_lots) and inst10_lots < 0 else 0.0
-
-    ma5 = float(d["close"].rolling(5).mean().iloc[-1])
-
-    # 共通排除條件
-    avg5_lots = _to_lots(prev5_avg)
-    common_ok = bool(c > 5 and finite(avg5_lots) and avg5_lots > 500)
-
-    # ①：20日漲幅>10%、1日週轉率>10%、股本<20億
-    c1 = bool(
-        common_ok
-        and finite(r20) and r20 > 10
-        and finite(turnover) and turnover > 10
-        and finite(capital) and capital < 2_000_000_000
-    )
-
-    # ②：今日量 > 5日均量20%、近30日漲跌幅<1%，再看外資投信動態
-    # 「漲跌幅<1%」採 abs()，代表長期橫盤。
-    c2 = bool(
-        common_ok
-        and finite(vol_ratio5) and vol_ratio5 > 0.20
-        and finite(r30) and abs(r30) < 1
-    )
-
-    # ③：10日漲幅>1%、今日量>5日均量300%、今日量>100張、股本<30億
-    today_lots = _to_lots(today_vol)
-    c3 = bool(
-        common_ok
-        and finite(r10) and r10 > 1
-        and finite(vol_ratio5) and vol_ratio5 > 3.0
-        and finite(today_lots) and today_lots > 100
-        and finite(capital) and capital < 3_000_000_000
-    )
-
-    # ④：今日股價<5MA、40日漲幅>30%、近10日三大法人賣超>10000張
-    c4 = bool(
-        common_ok
-        and c < ma5
-        and finite(r40) and r40 > 30
-        and finite(inst10_sell_lots) and inst10_sell_lots > 10000
-    )
-
-    # ⑤：股價<50、近三季EPS合計>0.5、最近月營收歷史新高、YoY>20%
-    eps3 = fund.get("eps_3q_sum", np.nan)
-    rev_yoy = fund.get("revenue_yoy", np.nan)
-    rev_high = bool(fund.get("revenue_record_high", False))
-    c5 = bool(
-        common_ok
-        and c < 50
-        and finite(eps3) and eps3 > 0.5
-        and rev_high
-        and finite(rev_yoy) and rev_yoy > 20
-    )
-
-    out = {
-        "①強勢熱門": {
-            "match": c1, "r20": r20, "turnover": turnover,
-            "capital_b": capital/1e8 if finite(capital) else np.nan,
-            "rule": "20日漲幅>10%＋週轉率>10%＋股本<20億"
-        },
-        "②盤整待突破": {
-            "match": c2, "r30": r30, "vol_ratio5": vol_ratio5,
-            "inst5": _to_lots(cp.get("total5", np.nan)),
-            "rule": "今日量>5日均量20%＋30日漲跌幅絕對值<1%＋法人動態"
-        },
-        "③剛起動": {
-            "match": c3, "r10": r10, "vol_ratio5": vol_ratio5,
-            "today_lots": today_lots, "capital_b": capital/1e8 if finite(capital) else np.nan,
-            "rule": "10日漲幅>1%＋今日量>5日均量300%＋>100張＋股本<30億"
-        },
-        "④強勢股拉回": {
-            "match": c4, "r40": r40, "below_ma5": c < ma5,
-            "inst10_sell_lots": inst10_sell_lots,
-            "rule": "股價<5MA＋40日漲幅>30%＋10日三大法人賣超>10000張"
-        },
-        "⑤營運成長潛力": {
-            "match": c5, "eps3": eps3, "rev_yoy": rev_yoy, "rev_high": rev_high,
-            "rule": "股價<50＋近三季EPS>0.5＋月營收歷史新高＋YoY>20%"
-        },
-        "_common": {
-            "match": common_ok, "price": c, "avg5_lots": avg5_lots,
-            "rule": "股價>5元＋5日均量>500張"
-        }
-    }
-    return out
-
-
-def blend_course_with_lifecycle(full_eval, course):
-    """
-    把『課程原版數字條件』與『賊大資金生命週期』合併：
-    - ①～⑤：原版數字條件 + 階段分數交叉驗證
-    - ⑥～⑧：沿用資金/技術/融券階段判斷
-    """
-    scores = dict(full_eval.get("scores", {}))
-    reasons = dict(full_eval.get("reasons", {}))
-    confidence = dict(full_eval.get("confidence", {}))
-
-    for stage in ["①強勢熱門","②盤整待突破","③剛起動","④強勢股拉回","⑤營運成長潛力"]:
-        cr = course.get(stage, {})
-        if not cr:
-            continue
-        base = float(scores.get(stage, 0))
-        if cr.get("match"):
-            # 原版條件成立：大幅提高，但仍保留生命週期分數作校驗
-            scores[stage] = min(100, round(base*0.60 + 40))
-            reasons[stage] = (reasons.get(stage,"") + "；原版數字條件✅").strip("；")
-        else:
-            # 原版不成立：不直接判死刑，降權後可列「接近」
-            scores[stage] = round(base*0.72)
-            reasons[stage] = (reasons.get(stage,"") + "；原版數字條件未完全成立").strip("；")
-
-        confidence[stage] = (
-            "高" if scores[stage] >= 85 and cr.get("match")
-            else "中" if scores[stage] >= 70
-            else "低"
-        )
-
-    # ①～⑤正式成立：原版 match 且融合分>=70
-    # ⑥～⑧：沿用原本分數/可信度
-    technical_order = ["⑥強勢噴出","④強勢股拉回","③剛起動","⑦跌深轉折","①強勢熱門","⑧整理轉強","②盤整待突破"]
-    eligible = []
-    for stage, sc in scores.items():
-        if stage in ["①強勢熱門","②盤整待突破","③剛起動","④強勢股拉回"]:
-            if course.get(stage,{}).get("match") and sc >= 70:
-                eligible.append(stage)
-        elif stage == "⑤營運成長潛力":
-            # ⑤作基本面副標籤，不搶主技術階段
-            continue
-        elif sc >= 70 and confidence.get(stage) != "低":
-            eligible.append(stage)
-
-    primary = next((x for x in technical_order if x in eligible), None)
-    tags = [primary] if primary else []
-
-    if course.get("⑤營運成長潛力",{}).get("match") and scores.get("⑤營運成長潛力",0) >= 70:
-        tags.append("⑤營運成長潛力")
-
-    near = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
-
-    merged = dict(full_eval)
-    merged.update({
-        "primary": primary,
-        "tags": tags,
-        "scores": scores,
-        "reasons": reasons,
-        "confidence": confidence,
-        "near": near,
-        "course": course,
-    })
-    return merged
-
-
-def daily_homework_labels(a):
-    """
-    對應課程『每天的功課』：
-    1/3/5日強弱、量大股、大幅震盪股、強勢/弱勢。
-    """
-    d = a.get("data")
-    if d is None or len(d) < 25:
-        return []
-    c = float(d["close"].iloc[-1])
-    ret1 = (c/float(d["close"].iloc[-2])-1)*100
-    ret3 = (c/float(d["close"].iloc[-4])-1)*100
-    ret5 = (c/float(d["close"].iloc[-6])-1)*100
-    v = pd.to_numeric(d["volume"], errors="coerce")
-    v20 = float(v.tail(20).mean())
-    vr20 = float(v.iloc[-1])/v20 if v20>0 else np.nan
-    rng5 = (float(d["max"].tail(5).max())/float(d["min"].tail(5).min())-1)*100
-    ma5 = float(d["close"].rolling(5).mean().iloc[-1])
-    ma10 = float(d["close"].rolling(10).mean().iloc[-1])
-
-    labels = []
-    if ret1 > 2: labels.append("1日強勢")
-    if ret3 > 4: labels.append("3日強勢")
-    if ret5 > 6: labels.append("5日強勢")
-    if ret1 < -2: labels.append("1日弱勢")
-    if ret3 < -4: labels.append("3日弱勢")
-    if ret5 < -6: labels.append("5日弱勢")
-    if finite(vr20) and vr20 >= 1.8: labels.append("量大股")
-    if rng5 >= 12: labels.append("大幅震盪股")
-    if c > ma5 > ma10: labels.append("強勢股")
-    if c < ma5 < ma10: labels.append("弱勢股")
-    return labels
-
-
-def evaluate_zeida_full(a, fund, sh, cp, cap, close, day_chg=np.nan):
-    """
-    依使用者提供的「賊大戰術條件一～八」圖片做完整評估。
-    每個條件分：必要條件 / 加分條件 / 排除條件。
-    資料缺失時降低可信度，不用猜測補值。
-    """
-    d = a.get("data")
-    if d is None or d.empty:
-        return {"tags":[], "primary":None, "scores":{}, "reasons":{}, "confidence":{}}
-
-    c = float(close)
-    r20 = a.get("r20", np.nan)
-    r40 = a.get("r40", np.nan)
-    b5 = a.get("bias5", np.nan)
-    b20 = a.get("bias20", np.nan)
-    b60 = a.get("bias60", np.nan)
-    vr = a.get("vr", np.nan)
-    s20 = a.get("s20", np.nan)
-    ma5 = float(d["ma5"].iloc[-1]) if "ma5" in d.columns and finite(d["ma5"].iloc[-1]) else np.nan
-    ma20 = float(d["ma20"].iloc[-1]) if "ma20" in d.columns and finite(d["ma20"].iloc[-1]) else np.nan
-    ma60 = float(d["ma60"].iloc[-1]) if "ma60" in d.columns and finite(d["ma60"].iloc[-1]) else np.nan
-    hi20 = float(d["max"].tail(20).max())
-    lo20 = float(d["min"].tail(20).min())
-    hi40 = float(d["max"].tail(40).max())
-    hi60 = float(d["max"].tail(60).max())
-    range20 = (hi20/lo20-1)*100 if lo20>0 else np.nan
-    from_hi40 = (c/hi40-1)*100 if hi40>0 else np.nan
-    from_hi60 = (c/hi60-1)*100 if hi60>0 else np.nan
-
-    chg = d["close"].pct_change()*100
-    big_up5 = int((chg.tail(5)>=5).sum())
-    prior20 = ((float(d["close"].iloc[-2])/float(d["close"].iloc[-22])-1)*100
-               if len(d)>22 and finite(d["close"].iloc[-22]) else np.nan)
-
-    v = pd.to_numeric(d["volume"], errors="coerce")
-    v5 = float(v.tail(5).mean()) if len(v)>=5 else np.nan
-    vprev5 = float(v.iloc[-10:-5].mean()) if len(v)>=10 else np.nan
-    volume_rising = finite(v5) and finite(vprev5) and v5 > vprev5*1.10
-    volume_contract = finite(v5) and finite(vprev5) and v5 < vprev5*0.90
-
-    # 近5日是否曾跌破5MA，以及今日是否重新站回
-    ma5s = d["close"].rolling(5).mean()
-    recent_below5 = bool((d["close"].iloc[-6:-1] < ma5s.iloc[-6:-1]).fillna(False).any()) if len(d)>=6 else False
-    reclaimed5 = recent_below5 and finite(ma5) and c > ma5
-
-    inst5 = cp.get("total5", cp.get("total", 0.0))
-    inst10 = cp.get("total10", 0.0)
-    foreign5 = cp.get("foreign5", cp.get("foreign", 0.0))
-    chip_available = bool(cp.get("available", False))
-    inst_positive = inst5 > 0
-    inst_continue = inst5 > 0 and inst10 > 0 and cp.get("positive_days5",0) >= 3
-    layout_start = inst5 > 0 and cp.get("positive_days5",0) >= 3
-
-    short_bal = sh.get("balance", np.nan)
-    short_change5 = sh.get("change5", np.nan)
-    avg20vol = float(v.tail(20).mean()) if len(v)>=20 else np.nan
-    short_ratio = short_bal/avg20vol if finite(short_bal) and finite(avg20vol) and avg20vol>0 else np.nan
-    short_high = finite(short_ratio) and short_ratio >= 0.30
-    short_increasing = finite(short_change5) and short_change5 > 0
-    short_covering = finite(short_change5) and short_change5 < 0
-
-    fund_pass = bool(fund.get("pass"))
-    rev_yoy = fund.get("revenue_yoy", np.nan)
-    eps = fund.get("eps", np.nan)
-    eps_growth = fund.get("eps_growth", np.nan)
-    pe_est = c/eps if finite(eps) and eps>0 else np.nan
-    valuation_ok = finite(pe_est) and 5 <= pe_est <= 35
-
-    small_cap = cap.get("small_cap")
-    cap_known = small_cap is not None
-
-    scores, reasons, conf = {}, {}, {}
-
-    def finish(name, score, why, missing=0, hard_fail=False):
-        score = max(0, min(100, int(round(score))))
-        if hard_fail:
-            score = min(score, 59)
-        scores[name] = score
-        reasons[name] = "；".join(why[:5])
-        # 可信度同時看分數與資料完整度
-        cscore = score - missing*8
-        conf[name] = "高" if cscore >= 82 else "中" if cscore >= 68 else "低"
-
-    # ① 強勢熱門小型股：主升初期
-    why=[]; sc=0
-    uptrend = finite(r20) and 5 <= r20 <= 28 and c > ma20
-    active_vol = finite(vr) and vr >= 1.15
-    not_too_extended = finite(b20) and b20 <= 12
-    sc += _score_bool(uptrend,25); sc += _score_bool(active_vol,20)
-    sc += _score_bool(not_too_extended,15); sc += _score_bool(inst_positive,15)
-    sc += _score_bool(small_cap is True,15); sc += _score_bool(c >= hi20*.95,10)
-    if uptrend: why.append("股價走強")
-    if active_vol: why.append("量能活躍")
-    if inst_positive: why.append("資金流入")
-    if small_cap is True: why.append("股本偏小")
-    if c >= hi20*.95: why.append("接近20日高")
-    finish("①強勢熱門", sc, why, missing=(0 if chip_available else 1)+(0 if cap_known else 1),
-           hard_fail=not (uptrend and active_vol and not_too_extended))
-
-    # ② 盤整待突破股：突破前整理
-    why=[]; sc=0
-    base = finite(range20) and range20 <= 15 and finite(r20) and abs(r20)<=12
-    near_break = c >= hi20*.955
-    stable = finite(b20) and abs(b20)<=8
-    sc += _score_bool(base,35); sc += _score_bool(near_break,20)
-    sc += _score_bool(active_vol or volume_rising,20); sc += _score_bool(stable,15)
-    sc += _score_bool(inst5>=0,10)
-    if base: why.append("長期橫盤收斂")
-    if near_break: why.append("接近平台上緣")
-    if volume_rising: why.append("近期量能放大")
-    if inst5>=0: why.append("法人未明顯轉空")
-    finish("②盤整待突破", sc, why, missing=(0 if chip_available else 1),
-           hard_fail=not (base and near_break))
-
-    # ③ 剛起動：核心型態優先，法人/股本只加分，不作硬門檻
-    why=[]; sc=0
-    little_prior = finite(prior20) and prior20 < 12 and finite(r40) and r40 < 22
-    first_wave = big_up5 <= 1
-    sudden_vol = finite(vr) and vr >= 1.25
-    first_attack = c >= hi20*.965 and (not finite(day_chg) or day_chg>=1.0)
-    core3 = little_prior and first_wave and sudden_vol and first_attack
-
-    sc += _score_bool(little_prior,30)
-    sc += _score_bool(first_wave,20)
-    sc += _score_bool(sudden_vol,25)
-    sc += _score_bool(first_attack,20)
-    sc += _score_bool(inst5>=0,3)
-    sc += _score_bool(small_cap is True,2)
-
-    if little_prior: why.append("前面漲幅不大")
-    if sudden_vol: why.append("突然放量")
-    if first_wave: why.append("近5日未連續噴出")
-    if first_attack: why.append("第一波攻擊")
-    if inst5>0: why.append("法人偏多")
-    if small_cap is True: why.append("股本偏小")
-
-    finish("③剛起動", sc, why, missing=0, hard_fail=not core3)
-
-    # ④ 強勢股拉回：核心型態優先；法人續買、量縮是加分，不作硬門檻
-    why=[]; sc=0
-    prior_surge = finite(r40) and r40 >= 25
-    pullback = finite(from_hi40) and -18 <= from_hi40 <= -3
-    trend_alive = c > ma20 and (not finite(b60) or b60 > -5)
-    ma5_wash = recent_below5 or reclaimed5 or (finite(b5) and -5<=b5<=5)
-    core4 = prior_surge and pullback and trend_alive and ma5_wash
-
-    sc += _score_bool(prior_surge,30)
-    sc += _score_bool(pullback,20)
-    sc += _score_bool(trend_alive,20)
-    sc += _score_bool(ma5_wash,15)
-    sc += _score_bool(volume_contract,5)
-    sc += _score_bool(inst_continue,10)
-
-    if prior_surge: why.append("前40日已明顯上漲")
-    if pullback: why.append("由波段高點拉回")
-    if trend_alive: why.append("主要趨勢未破")
-    if ma5_wash: why.append("有測試/跌破5MA洗盤")
-    if reclaimed5: why.append("重新站回5MA")
-    if volume_contract: why.append("回檔量縮")
-    if inst_continue: why.append("法人續買")
-
-    finish("④強勢股拉回", sc, why, missing=0, hard_fail=not core4)
-
-    # ⑤ 營運成長潛力：基本面布局
-    why=[]; sc=0
-    rev_ok = finite(rev_yoy) and rev_yoy >= 10
-    eps_ok = finite(eps) and eps > 0 and (not finite(eps_growth) or eps_growth>=0)
-    sc += _score_bool(rev_ok,30); sc += _score_bool(eps_ok,25)
-    sc += _score_bool(layout_start,20); sc += _score_bool(valuation_ok,15)
-    sc += _score_bool(finite(r20) and r20 < 25,10)
-    if rev_ok: why.append("營收成長")
-    if eps_ok: why.append("EPS正向")
-    if layout_start: why.append("法人開始布局")
-    if valuation_ok: why.append("估值未明顯過熱")
-    if finite(r20) and r20<25: why.append("股價尚未完全反映")
-    finish("⑤營運成長潛力", sc, why,
-           missing=(0 if finite(rev_yoy) else 1)+(0 if finite(eps) else 1)+(0 if chip_available else 1),
-           hard_fail=not fund_pass)
-
-    # ⑥ 強勢噴出（軋空中）
-    why=[]; sc=0
-    strong_burst = finite(r40) and r40>=25 and c>=hi40*.98
-    burst_vol = (finite(vr) and vr>=1.25) or (finite(day_chg) and day_chg>=6)
-    sc += _score_bool(strong_burst,35); sc += _score_bool(burst_vol,20)
-    sc += _score_bool(short_high,20); sc += _score_bool(short_covering,15)
-    sc += _score_bool(inst5>=0,10)
-    if strong_burst: why.append("強勢上漲創高")
-    if burst_vol: why.append("爆量/加速")
-    if short_high: why.append("融券偏高")
-    if short_covering: why.append("融券回補跡象")
-    if inst5>=0: why.append("法人未明顯轉空")
-    finish("⑥強勢噴出", sc, why,
-           missing=(0 if finite(short_bal) else 1)+(0 if chip_available else 1),
-           hard_fail=not (strong_burst and burst_vol))
-
-    # ⑦ 跌深轉折出量：底部剛發動
-    why=[]; sc=0
-    deep = (finite(a.get("r60")) and a.get("r60")<=-20) or (finite(from_hi60) and from_hi60<=-25)
-    near20 = finite(b20) and -3<=b20<=10
-    reclaim_short = c>ma20
-    sc += _score_bool(deep,35); sc += _score_bool(sudden_vol,25)
-    sc += _score_bool(reclaim_short,20); sc += _score_bool(near20,10)
-    sc += _score_bool(a.get("macd_positive") or a.get("hist_now",0)>=a.get("hist_prev",0),10)
-    if deep: why.append("長期跌深")
-    if sudden_vol: why.append("突然爆量")
-    if reclaim_short: why.append("站回短中均線")
-    if near20: why.append("仍在底部轉折區")
-    finish("⑦跌深轉折", sc, why, hard_fail=not (deep and sudden_vol and reclaim_short and near20))
-
-    # ⑧ 整理轉強（軋空前）：整理吸籌期
-    why=[]; sc=0
-    above_mid = c>ma60 and c>ma20
-    trend_not_extended = finite(r40) and r40<20 and finite(b20) and b20<7 and finite(b60) and b60<12
-    base2 = finite(range20) and range20<=16
-    sc += _score_bool(above_mid,25); sc += _score_bool(trend_not_extended,20)
-    sc += _score_bool(base2,15); sc += _score_bool(short_increasing,20)
-    sc += _score_bool(volume_rising,10); sc += _score_bool(inst5>=0,10)
-    if above_mid: why.append("站上中期均線")
-    if base2: why.append("仍在整理區")
-    if short_increasing: why.append("融券增加")
-    if volume_rising: why.append("量能逐步增加")
-    if inst5>=0: why.append("吸籌跡象")
-    finish("⑧整理轉強", sc, why,
-           missing=(0 if finite(short_change5) else 1)+(0 if chip_available else 1),
-           hard_fail=not (above_mid and trend_not_extended and base2))
-
-    # 成立：一般策略分數>=70且可信度至少中；
-    # ③/④因核心型態可直接從K線確認，只要核心成立且分數>=65就保留，不因法人資料缺失消失。
-    technical_order = ["⑥強勢噴出","④強勢股拉回","③剛起動","⑦跌深轉折","①強勢熱門","⑧整理轉強","②盤整待突破"]
-    eligible = []
-    for k,v in scores.items():
-        if k in ["③剛起動","④強勢股拉回"]:
-            if v >= 65:
-                eligible.append(k)
-        elif v >= 70 and conf.get(k)!="低":
-            eligible.append(k)
-    primary = next((k for k in technical_order if k in eligible), None)
-
-    # 若沒有正式成立，保留最高分作「接近」資訊，但不硬塞分類。
-    near = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
-
-    tags = []
-    if primary:
-        tags.append(primary)
-    if scores.get("⑤營運成長潛力",0)>=70 and conf.get("⑤營運成長潛力")!="低":
-        tags.append("⑤營運成長潛力")
-
-    return {
-        "tags":tags,
-        "primary":primary,
-        "scores":scores,
-        "reasons":reasons,
-        "confidence":conf,
-        "near":near,
-        "short_ratio":short_ratio,
-        "pe_est":pe_est,
-        "capital":cap.get("capital",np.nan),
-        "market_cap":cap.get("market_cap",np.nan),
-        "small_cap":small_cap,
-    }
-
-
-def _backtest_signals(d):
-    """用與即時分類相同的核心技術條件回測，避免即時一套、回測另一套。"""
-    x = d.copy().reset_index(drop=True)
-    for k in [5,10,20,60]:
-        x[f"ma{k}"] = x["close"].rolling(k).mean()
-    x["v20"] = x["volume"].rolling(20).mean()
-    x["vr"] = x["volume"] / x["v20"].replace(0,np.nan)
-    x["hi20"] = x["max"].rolling(20).max()
-    x["lo20"] = x["min"].rolling(20).min()
-    x["hi40"] = x["max"].rolling(40).max()
-    x["hi60"] = x["max"].rolling(60).max()
-    x["r20"] = (x["close"]/x["close"].shift(20)-1)*100
-    x["r40"] = (x["close"]/x["close"].shift(40)-1)*100
-    x["r60"] = (x["close"]/x["close"].shift(60)-1)*100
-    x["prior20"] = (x["close"].shift(1)/x["close"].shift(21)-1)*100
-    x["daychg"] = (x["close"]/x["close"].shift(1)-1)*100
-    x["from_hi40"] = (x["close"]/x["hi40"]-1)*100
-    x["from_hi60"] = (x["close"]/x["hi60"]-1)*100
-    x["range20"] = (x["hi20"]-x["lo20"]) / x["lo20"].replace(0,np.nan) * 100
-    x["bias20"] = (x["close"]/x["ma20"]-1)*100
-    x["bias60"] = (x["close"]/x["ma60"]-1)*100
-    x["ma20_slope10"] = (x["ma20"]/x["ma20"].shift(10)-1)*100
-
-    e12=x["close"].ewm(span=12,adjust=False).mean()
-    e26=x["close"].ewm(span=26,adjust=False).mean()
-    hist=(e12-e26)-(e12-e26).ewm(span=9,adjust=False).mean()
-
-    ma5 = x["ma5"]
-    prev_below5 = pd.Series(False,index=x.index)
-    for shift_n in range(1,6):
-        prev_below5 = prev_below5 | (x["close"].shift(shift_n) < ma5.shift(shift_n))
-
-    sig = {}
-    sig["⑦跌深轉折"] = (
-        ((x["r60"]<=-20)|(x["from_hi60"]<=-25))
-        & (x["close"]>x["ma20"])
-        & x["bias20"].between(-3,10)
-        & (x["vr"]>=1.60)
-        & (hist>=hist.shift(1)) & (x["daychg"]>0)
-    )
-    sig["②盤整待突破"] = (
-        (x["range20"]<=15) & (x["r20"].abs()<=12)
-        & (x["bias20"].abs()<=8) & (x["close"]>=x["hi20"]*.955)
-        & x["vr"].between(.9,2.0) & (x["daychg"]<6)
-    )
-    sig["⑧整理轉強"] = (
-        (x["close"]>x["ma60"]) & (x["close"]>x["ma20"])
-        & (x["ma20_slope10"]>0)
-        & (x["r40"]<20) & (x["r20"]<12)
-        & (x["bias20"]<7) & (x["bias60"]<12)
-        & (x["range20"]<=16) & x["vr"].between(.9,1.7)
-        & (x["daychg"]<6)
-    )
-    x["bigup5"] = (
-        (x["daychg"]>=5).astype(int)
-        .rolling(5, min_periods=1).sum()
-    )
-    sig["③剛起動"] = (
-        (x["prior20"]<12) & (x["r40"]<22)
-        & (x["bigup5"]<=1)
-        & (x["vr"]>=1.25) & (x["close"]>=x["hi20"]*.965)
-        & (x["daychg"]>=1.0)
-    )
-    sig["①強勢熱門"] = (
-        (x["ma5"]>x["ma10"])&(x["ma10"]>x["ma20"])&(x["close"]>x["ma20"])
-        & x["r20"].between(5,28) & (x["bias20"]<=12)
-        & (x["vr"]>=1.15) & (x["close"]>=x["hi20"]*.95)
-    )
-    sig["④強勢股拉回"] = (
-        (x["r40"]>=25) & x["from_hi40"].between(-18,-3)
-        & (x["close"]>x["ma20"])
-        & (prev_below5 | ((x["close"]/x["ma5"]-1)*100).between(-5,5))
-    )
-    sig["⑥強勢噴出"] = (
-        (x["r40"]>=25) & (x["close"]>=x["hi40"]*.98)
-        & ((x["vr"]>=1.25)|(x["bias20"]>=12)|(x["daychg"]>=6))
-    )
-    return x, sig
-
-
-def backtest_one_history(raw):
-    """回傳各策略訊號後 1/5/10 日績效與10日最大不利幅度。"""
-    if raw is None or len(raw) < 90:
-        return []
-    x, sigs = _backtest_signals(raw)
+@st.cache_data(ttl=60*60*12, show_spinner=False)
+def fetch_history(days_back=78, max_workers=8):
+    end = date.today()
+    days = [end - timedelta(days=i) for i in range(days_back)]
+    frames = []
+
+    def one(d):
+        tw = fetch_twse_day(d.strftime("%Y%m%d"))
+        tp = fetch_tpex_day(d.strftime("%Y/%m/%d"))
+        return tw, tp
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(one, d) for d in days]
+        for f in as_completed(futs):
+            try:
+                tw, tp = f.result()
+                if not tw.empty:
+                    frames.append(tw)
+                if not tp.empty:
+                    frames.append(tp)
+            except Exception:
+                pass
+
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates(["date", "stock_id", "market"], keep="last")
+    df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    return df
+
+# ---------------------------
+# 公司主檔：股本 / 每股面額
+# ---------------------------
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def fetch_profiles():
     rows = []
-    for name, mask in sigs.items():
-        idxs = np.where(mask.fillna(False).to_numpy())[0]
-        for i in idxs:
-            if i + 10 >= len(x):
-                continue
-            entry = float(x.loc[i,"close"])
-            if not finite(entry) or entry <= 0:
-                continue
-            r1 = (float(x.loc[i+1,"close"])/entry-1)*100
-            r5 = (float(x.loc[i+5,"close"])/entry-1)*100
-            r10 = (float(x.loc[i+10,"close"])/entry-1)*100
-            future_low = pd.to_numeric(x.loc[i+1:i+10,"min"],errors="coerce").min()
-            mae10 = (float(future_low)/entry-1)*100 if finite(future_low) else np.nan
-            rows.append({"策略":name,"1日":r1,"5日":r5,"10日":r10,"MAE10":mae10})
-    return rows
-
-
-def backtest_summary(details):
-    all_rows = []
-    for a in details.values():
-        try:
-            all_rows.extend(backtest_one_history(a.get("data")))
-        except Exception:
-            pass
-    if not all_rows:
-        return pd.DataFrame()
-    d = pd.DataFrame(all_rows)
-    out = []
-    order = ["①強勢熱門","②盤整待突破","③剛起動","④強勢股拉回","⑤營運成長潛力","⑥強勢噴出","⑦跌深轉折","⑧整理轉強"]
-    for name in order:
-        z = d[d["策略"]==name]
-        if z.empty:
-            out.append({"策略":name,"樣本數":0,"隔日勝率%":np.nan,"5日勝率%":np.nan,"10日勝率%":np.nan,"平均5日%":np.nan,"平均10日%":np.nan,"10日最大不利%":np.nan})
-            continue
-        out.append({
-            "策略":name,
-            "樣本數":len(z),
-            "隔日勝率%":float((z["1日"]>0).mean()*100),
-            "5日勝率%":float((z["5日"]>0).mean()*100),
-            "10日勝率%":float((z["10日"]>0).mean()*100),
-            "平均5日%":float(z["5日"].mean()),
-            "平均10日%":float(z["10日"].mean()),
-            "10日最大不利%":float(z["MAE10"].min()) if z["MAE10"].notna().any() else np.nan,
-        })
-    return pd.DataFrame(out)
-
-def grade_for(score):
-    if score >= 90: return "S"
-    if score >= 80: return "A+"
-    if score >= 70: return "A"
-    if score >= 60: return "A-"
-    if score >= 50: return "B"
-    return "C"
-
-def risk_class(v):
-    if not finite(v): return ""
-    return "risk-low" if float(v) <= 30 else "risk-mid" if float(v) <= 60 else "risk-high"
-
-def f1(v, dash="-"):
-    return dash if not finite(v) else f"{float(v):.1f}"
-
-def f2(v, dash="-"):
-    return dash if not finite(v) else f"{float(v):.2f}"
-
-def money_yi(v):
-    return "-" if not finite(v) else f"{float(v)/1e8:.1f}"
-
-def signed_pct(v):
-    return "-" if not finite(v) else f"{float(v):+.2f}%"
-
-def price2(v):
-    return "-" if not finite(v) else f"{float(v):,.2f}"
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def taiex_history():
-    """台股加權指數 ^TWII，失敗回空表，避免影響個股掃描。"""
-    for host in YAHOO_HOSTS:
-        try:
-            r = requests.get(
-                f"{host}/%5ETWII",
-                params={"range":"1y","interval":"1d","includePrePost":"false"},
-                headers=HEAD, timeout=20
-            )
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            result = j.get("chart", {}).get("result")
-            if not result:
-                continue
-            z = result[0]
-            ts = z.get("timestamp") or []
-            q = (z.get("indicators", {}).get("quote") or [{}])[0]
-            L = len(ts)
-            if L < 60:
-                continue
-            def arr(k):
-                a = q.get(k) or []
-                return (a + [None]*L)[:L]
-            d = pd.DataFrame({
-                "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert("Asia/Taipei").tz_localize(None),
-                "open": arr("open"),
-                "max": arr("high"),
-                "min": arr("low"),
-                "close": arr("close"),
-                "volume": arr("volume"),
-            })
-            for c in ["open","max","min","close","volume"]:
-                d[c] = pd.to_numeric(d[c], errors="coerce")
-            d = d.dropna(subset=["open","max","min","close"]).sort_values("date").reset_index(drop=True)
-            if len(d) >= 60:
-                return d
-        except Exception:
-            continue
-    return pd.DataFrame()
-
-@st.cache_data(ttl=600, show_spinner=False)
-def twse_foreign_flow():
-    """TWSE 三大法人：外資及陸資(不含外資自營商)買進、賣出、買賣超。"""
-    urls = [
-        "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json",
-        "https://www.twse.com.tw/fund/BFI82U?response=json",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEAD, timeout=20)
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            for row in j.get("data", []):
-                name = str(row[0]).replace(" ", "")
-
-                # TWSE 正式名稱常是：
-                # 「外資及陸資(不含外資自營商)」
-                # 舊版因為看到字串裡有「自營商」就整列排除，導致永遠抓不到外資。
-                is_foreign_row = (
-                    name.startswith("外資及陸資")
-                    or "外資及陸資(不含外資自營商)" in name
-                    or "外資及陸資（不含外資自營商）" in name
-                )
-
-                if is_foreign_row:
-                    nums = []
-                    for x in row[1:]:
-                        try:
-                            nums.append(float(str(x).replace(",", "")))
-                        except Exception:
-                            nums.append(np.nan)
-
-                    # BFI82U 常見順序：買進、賣出、買賣差額
-                    buy = nums[0] if len(nums) > 0 else np.nan
-                    sell = nums[1] if len(nums) > 1 else np.nan
-                    net = nums[-1] if nums else np.nan
-
-                    if finite(buy) or finite(sell) or finite(net):
-                        return {
-                            "buy": buy,
-                            "sell": sell,
-                            "net": net,
-                            "date": j.get("date", ""),
-                            "source_name": row[0],
-                        }
-        except Exception:
-            continue
-    return {"buy":np.nan, "sell":np.nan, "net":np.nan, "date":""}
-
-def taiex_levels(d):
-    if d is None or d.empty or len(d) < 60:
-        return {}
-    x = d.copy()
-    x["ma20"] = x["close"].rolling(20).mean()
-    x["ma60"] = x["close"].rolling(60).mean()
-    c = float(x["close"].iloc[-1])
-    prev = float(x["close"].iloc[-2])
-    vals = [
-        float(x["min"].tail(20).min()),
-        float(x["min"].tail(60).min()),
-        float(x["ma20"].iloc[-1]),
-        float(x["ma60"].iloc[-1]),
-        float(x["max"].tail(20).max()),
-        float(x["max"].tail(60).max()),
-    ]
-    supports = sorted({round(v,2) for v in vals if finite(v) and v < c}, reverse=True)
-    resist = sorted({round(v,2) for v in vals if finite(v) and v > c})
-    return {
-        "close": c,
-        "chg_pct": ((c/prev)-1)*100 if prev else np.nan,
-        "s1": supports[0] if supports else np.nan,
-        "s2": supports[1] if len(supports)>1 else np.nan,
-        "r1": resist[0] if resist else np.nan,
-        "r2": resist[1] if len(resist)>1 else np.nan,
-    }
-
-def billion(v):
-    return "-" if not finite(v) else f"{float(v)/1e8:,.1f} 億"
-
-st.markdown("""
-<style>
-:root{
-  --bg:#07111d;--panel:#091827;--panel2:#0c1e30;--line:#25435f;--line2:#28577c;
-  --text:#ecf4fb;--muted:#94a9bc;--blue:#2d9dff;--green:#61d78c;--yellow:#f2b238;
-  --orange:#ff9c42;--red:#ff625f;
-}
-.stApp{background:radial-gradient(circle at top left,#0c1b32 0%,#07111d 44%,#050b12 100%);color:var(--text)}
-.block-container{max-width:1520px;padding-top:.45rem;padding-left:.65rem;padding-right:.65rem;padding-bottom:2rem}
-[data-testid="stHeader"]{background:transparent}
-[data-testid="stSidebar"]{display:none}
-.stButton>button{min-height:43px;border-radius:7px;border:1px solid #2575bb;background:#0d2b4a;color:#edf7ff;font-weight:850}
-.stButton>button:hover{border-color:#55b4ff;color:#fff}
-.hero{background:#081421;border:1px solid #203a55;border-radius:8px;padding:13px 15px;margin:5px 0 8px}
-.hero-title{font-size:31px;font-weight:950;line-height:1.05}.hero-title .pro{color:#ffc04a}
-.hero-sub{font-size:14px;color:#bdcddd;margin-top:5px}
-.nav{display:grid;grid-template-columns:repeat(5,1fr);border:1px solid #203b58;border-radius:7px;overflow:hidden;margin:0 0 10px}
-.nav div{background:#0a1724;padding:11px 5px;text-align:center;color:#d2dee9;font-weight:800;border-right:1px solid #203b58}
-.nav div:first-child{color:#5fb7ff;background:#0d2945;box-shadow:inset 0 0 0 1px #2b86d1}.nav div:last-child{border-right:0}
-.panel{background:#071522;border:1px solid #203b58;border-radius:8px;padding:11px 12px;margin:9px 0}
-.panel-title{color:#51adf5;font-size:18px;font-weight:900;margin-bottom:10px}
-.overview{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:9px}
-.ov{background:linear-gradient(180deg,#0a1928,#08141f);border:1px solid #27425d;border-radius:7px;text-align:center;padding:15px 9px;min-height:120px}
-.ov .t{font-size:14px;color:#d2dde7}.ov .v{font-size:31px;font-weight:950;margin-top:10px}.ov .s{font-size:13px;margin-top:5px;color:#9cb0c2}
-.ov.green .v,.ov.green .s{color:#67dc88}.ov.orange .v,.ov.orange .s{color:#f5aa37}.ov.red{border-color:#b33d40;box-shadow:inset 0 0 0 1px #8a2d30}.ov.red .v,.ov.red .s{color:#ff6c62}
-.filter-head{color:#4fa9ee;font-size:17px;font-weight:900}
-.table-wrap{overflow-x:auto;background:#06131f;border:1px solid #25445f;border-radius:7px}
-.stock-table{border-collapse:collapse;width:100%;min-width:1500px;font-size:12px}
-.stock-table th{background:#0e2235;color:#e6eef5;padding:8px 5px;border-right:1px solid #294a66;border-bottom:1px solid #2a506e;white-space:nowrap}
-.stock-table td{padding:8px 5px;text-align:center;border-right:1px solid #1c3449;border-bottom:1px solid #183047;color:#e9f0f7;white-space:nowrap}
-.stock-table tr:hover td{background:#0a1d2e}
-.rank{font-weight:900}.code{color:#74bbff;font-weight:900}.price{color:#ffc052;font-weight:900}.up{color:#ff7770;font-weight:900}.down{color:#61d78c;font-weight:900}
-.volr{color:#ff8556;font-weight:850}.risk-low{color:#69dc8d;font-weight:950}.risk-mid{color:#f1b13c;font-weight:950}.risk-high{color:#ff645e;font-weight:950}.rr{color:#f6a33e;font-weight:900}.grade{font-weight:950}
-.legend-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:10px}
-.legend{background:#071522;border:1px solid #203b58;border-radius:7px;padding:12px 13px;min-height:225px}.legend h4{color:#54aff4;margin:0 0 9px;font-size:17px}.legend p{color:#c7d4df;font-size:13px;line-height:1.5;margin:6px 0}
-.detail-grid{display:grid;grid-template-columns:1.5fr .9fr .9fr .9fr;gap:9px}.detail-box{background:#071522;border:1px solid #203b58;border-radius:7px;padding:11px}.detail-box h4{color:#54aff4;margin:0 0 8px}.detail-box p{color:#c8d5df;font-size:13px;line-height:1.55;margin:6px 0}
-.note{text-align:center;color:#94a9ba;font-size:12px;margin-top:12px}
-@media(max-width:900px){
- .overview{grid-template-columns:repeat(2,1fr)} .legend-grid{grid-template-columns:1fr} .detail-grid{grid-template-columns:1fr}
- .nav{grid-template-columns:1fr 1fr}.nav div{border-bottom:1px solid #203b58}.hero-title{font-size:27px}
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<div class="hero">
- <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap">
-  <div><div class="hero-title">🥷 賊大戰術 <span class="pro">Pro</span></div><div class="hero-sub">全市場智能選股系統（上市＋上櫃）</div></div>
-  <div style="color:#a1b3c4;font-size:13px">資料時間：盤後最新資料</div>
- </div>
-</div>
-<div class="nav">
- <div>🚀 全市場掃描</div><div>📊 大盤儀表板</div><div>◎ 自選股監控</div><div>⚙ 系統設定</div><div>❔ 使用說明</div>
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown(
-    """<div class="navbar">
-      <div class="navitem active">🚀 全市場掃描</div>
-      <div class="navitem">📊 大盤儀表板</div>
-      <div class="navitem">◎ 自選股監控</div>
-      <div class="navitem">⚙ 系統設定</div>
-      <div class="navitem">❔ 使用說明</div>
-    </div>""",
-    unsafe_allow_html=True
-)
-
-
-# ===== 大盤儀表板：支撐 / 壓力 / 外資買賣 =====
-_mkt = taiex_history()
-_lv = taiex_levels(_mkt)
-_fx = twse_foreign_flow()
-
-st.markdown('<div class="panel"><div class="panel-title">📊 大盤儀表板</div>', unsafe_allow_html=True)
-
-if _lv:
-    _net = _fx.get("net", np.nan)
-    _net_word = "買超" if finite(_net) and _net >= 0 else "賣超"
-    _net_color = "#ff6b70" if finite(_net) and _net >= 0 else "#56d388"
-
-    st.markdown(
-        f'<div class="overview">'
-        f'<div class="ov"><div class="k">加權指數</div><div class="v">{_lv["close"]:,.2f}</div><div class="s">{_lv["chg_pct"]:+.2f}%</div></div>'
-        f'<div class="ov"><div class="k">支撐 1</div><div class="v" style="color:#54d78a">{price2(_lv["s1"])}</div><div class="s">最近支撐</div></div>'
-        f'<div class="ov"><div class="k">支撐 2</div><div class="v" style="color:#54d78a">{price2(_lv["s2"])}</div><div class="s">第二支撐</div></div>'
-        f'<div class="ov"><div class="k">壓力 1</div><div class="v" style="color:#ffb14a">{price2(_lv["r1"])}</div><div class="s">最近壓力</div></div>'
-        f'<div class="ov"><div class="k">壓力 2</div><div class="v" style="color:#ff6b70">{price2(_lv["r2"])}</div><div class="s">第二壓力</div></div>'
-        f'</div>',
-        unsafe_allow_html=True
-    )
-
-    if finite(_net):
-        st.markdown(
-            f'<div class="detail-box" style="margin-top:9px">'
-            f'<h4>🌐 外資買賣（上市）</h4>'
-            f'<p>外資今日：<b style="color:{_net_color};font-size:20px">{_net_word} {abs(float(_net))/1e8:,.1f} 億</b></p>'
-            f'<p>買進：{billion(_fx.get("buy"))}　｜　賣出：{billion(_fx.get("sell"))}</p>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-    else:
-        st.info("外資買賣資料目前未取得；已嘗試 TWSE 三大法人資料來源。")
-
     try:
-        _p = _mkt.tail(90).copy()
-        fig_idx = go.Figure()
-        fig_idx.add_trace(go.Candlestick(
-            x=_p["date"], open=_p["open"], high=_p["max"],
-            low=_p["min"], close=_p["close"], name="TAIEX"
-        ))
-        for _name, _val in [("支撐1",_lv["s1"]),("支撐2",_lv["s2"]),("壓力1",_lv["r1"]),("壓力2",_lv["r2"])]:
-            if finite(_val):
-                fig_idx.add_hline(y=float(_val), line_dash="dot",
-                                  annotation_text=f"{_name} {float(_val):,.0f}")
-        fig_idx.update_layout(
-            height=330, margin=dict(l=8,r=8,t=28,b=8),
-            paper_bgcolor="#071522", plot_bgcolor="#071522",
-            font=dict(color="#dce9f4"), xaxis_rangeslider_visible=False,
-            title="加權指數近 90 日｜支撐 / 壓力"
-        )
-        fig_idx.update_xaxes(gridcolor="#173248")
-        fig_idx.update_yaxes(gridcolor="#173248")
-        st.plotly_chart(fig_idx, use_container_width=True)
+        for r in http_json(TWSE_PROFILE):
+            sid = str(r.get("公司代號", "")).strip()
+            if not is_stock_code(sid):
+                continue
+            cap = safe_num(first_present(
+                r,
+                names=("實收資本額", "實收資本額(元)"),
+                contains=("實收資本", "paidincapital")
+            ))
+            par = safe_num(first_present(
+                r,
+                names=("普通股每股面額",),
+                contains=("每股面額", "parvaluepershare", "parvalue")
+            ))
+            rows.append({
+                "stock_id": sid,
+                "market": "TWSE",
+                "profile_name": str(r.get("公司簡稱", "")).strip(),
+                "capital_ntd": cap,
+                "par_value": par,
+            })
     except Exception:
         pass
-else:
-    st.info("目前沒有取得加權指數資料；不影響個股全市場掃描。")
 
-st.markdown("</div>", unsafe_allow_html=True)
-
-
-# Scan filters - shaped like the mockup.
-st.markdown('<div class="panel"><div class="filter-head">初篩條件 <span style="font-size:12px;color:#9fb1c2">（可調整）</span></div></div>', unsafe_allow_html=True)
-col_money,col_price,col_day,col_month,col_season,col_kd = st.columns(6)
-min_money = col_money.selectbox("成交金額", [0.5,1.0,2.0,5.0], index=1, format_func=lambda x:f"≥ {x:g} 億")
-min_price = col_price.selectbox("股價", [5.0,10.0,20.0,50.0], index=0, format_func=lambda x:f"≥ {x:g} 元")
-min_day = col_day.selectbox("日漲跌幅", [0.0,1.0,2.0,3.0], index=1, format_func=lambda x:f"≥ {x:g}%")
-min_month = col_month.selectbox("月漲跌幅", [0.0,3.0,5.0,10.0], index=2, format_func=lambda x:f"≥ {x:g}%")
-season_rule = col_season.selectbox("季線位置", ["不限","站上季線"], index=1)
-kd_rule = col_kd.selectbox("KD 指標", ["不限","KD 黃金交叉"], index=1)
-
-scan = st.button("🔍 執行全市場掃描", type="primary", use_container_width=True)
-
-if scan:
-    snap, warnings = snapshot()
-    for w in warnings:
-        st.warning(w)
-
-    if snap.empty:
-        st.error("TWSE/TPEx 官方行情目前沒有取得。")
-    else:
-        for _c in ["close","volume","value","change"]:
-            snap[_c] = pd.to_numeric(snap[_c], errors="coerce")
-        snap["close"] = snap["close"].fillna(0.0)
-        snap["volume"] = snap["volume"].fillna(0.0)
-        snap["value"] = snap["value"].fillna(0.0)
-        snap["change"] = snap["change"].fillna(0.0)
-
-        snap["lots"] = snap["volume"]/1000.0
-        snap["activity"] = np.where(
-            snap["value"] > 0,
-            snap["value"],
-            snap["volume"] * snap["close"]
-        ).astype(float)
-        snap["chg_pct"] = (
-            pd.to_numeric(snap["change"],errors="coerce").fillna(0) /
-            snap["close"].replace(0,np.nan) * 100
-        ).replace([np.inf,-np.inf],np.nan).fillna(0)
-
-        # 全市場母體初篩：只先排除低價 / 低流動性。
-        # 不能先用「日漲幅 >= X」刪股票，否則④強勢股拉回（常是下跌/小漲）
-        # 和②盤整、③剛起動會在進入歷史K分析前就被消失。
-        snap = snap[
-            (snap["close"] >= min_price)
-            & (snap["activity"] >= min_money*1e8)
-        ].copy()
-
-        if snap.empty:
-            st.warning("目前沒有股票通過初篩條件。")
-        else:
-            # Rank broad market first; then deep-analyze the strongest 35 so month/MA/KD conditions can be used.
-            # 廣泛排名不再只偏愛「今天漲最多」。
-            # 流動性為主、單日漲幅只小幅加權，避免④拉回股永遠進不了深度分析。
-            snap["broad_score"] = (
-                45
-                + snap["activity"].rank(pct=True)*28
-                + snap["lots"].rank(pct=True)*17
-                + snap["chg_pct"].clip(-8,8)*0.8
-            ).clip(0,100)
-            snap = snap.sort_values(["broad_score","activity"],ascending=False).reset_index(drop=True)
-
-            # 大盤環境只抓一次，所有股票共用
-            _market_df = taiex_history()
-            market_regime = market_regime_score(_market_df)
-
-            # 多路候選池：
-            # A 強勢/啟動池：抓①③⑥
-            # B 拉回池：允許負報酬與小漲，專門避免漏掉④
-            # C 整理池：低波動但有流動性的股票，補②⑧
-            strong_pool = (
-                snap[snap["chg_pct"] >= min_day]
-                .sort_values(["broad_score","activity"], ascending=False)
-                .head(45)
-            )
-            pullback_pool = (
-                snap[snap["chg_pct"].between(-7.0, 4.0)]
-                .sort_values(["activity","lots"], ascending=False)
-                .head(40)
-            )
-            setup_pool = (
-                snap[snap["chg_pct"].between(-2.0, 5.0)]
-                .sort_values(["activity","broad_score"], ascending=False)
-                .head(35)
-            )
-
-            target = (
-                pd.concat([strong_pool, pullback_pool, setup_pool], ignore_index=True)
-                .drop_duplicates("stock_id")
-                .head(110)
-            )
-
-            st.caption(
-                f"深度分析候選：{len(target)} 檔｜強勢池 {len(strong_pool)}｜拉回池 {len(pullback_pool)}｜整理池 {len(setup_pool)}。"
-                " ③/④不再被『日漲幅門檻』提前刪除。"
-            )
-            details, inst, fundamentals, shorts, chips = {}, {}, {}, {}, {}
-            bar = st.progress(0,text="進行賊大①～⑧與技術分析…")
-            for i,z in enumerate(target.itertuples(index=False)):
-                try:
-                    h = hist(z.stock_id,z.market)
-                    h = merge_today_bar(h, z) if not h.empty else h
-                    a = analyze(h) if not h.empty else None
-                    if a is not None:
-                        # 賊大①～⑧分類必須先完整保留，不能被全域月漲幅/季線/KD先刪掉，
-                        # 否則④拉回與⑦跌深轉折會被系統性漏掉。
-                        fund = fundamental_growth(z.stock_id)
-                        sh = short_interest_5d(z.stock_id)
-                        cp = chip_trend_10d(z.stock_id)
-                        cap = capital_profile(z.stock_id, z.close)
-
-                        # 依使用者提供的賊大①～⑧原圖，加入股本、法人續買、融券、基本面、估值等完整條件。
-                        full_eval = evaluate_zeida_full(
-                            a, fund, sh, cp, cap,
-                            close=z.close,
-                            day_chg=z.chg_pct if finite(z.chg_pct) else np.nan
-                        )
-
-                        # 課程原版數字條件①～⑤ + 賊大資金生命週期交叉驗證
-                        course_eval = original_course_conditions(a, fund, cp, cap, z.close)
-                        full_eval = blend_course_with_lifecycle(full_eval, course_eval)
-
-                        quality = data_quality_score(a, fund, sh, cp, cap)
-                        final_conf = final_strategy_confidence(a, full_eval, quality, market_regime)
-
-                        # 最終可信度低於70：一般策略不硬分類。
-                        # 但③剛起動、④強勢股拉回的核心型態可由K線直接確認，
-                        # 所以保留分類，只把可信度標成低/中，不因法人或基本面缺資料整檔消失。
-                        if final_conf["score"] < 70 and full_eval.get("primary") not in ["③剛起動","④強勢股拉回"]:
-                            full_eval["primary"] = None
-                            full_eval["tags"] = [
-                                t for t in full_eval.get("tags",[])
-                                if t == "⑤營運成長潛力" and full_eval.get("scores",{}).get(t,0) >= 75
-                            ]
-
-                        # 完整規格結果覆蓋舊的純技術分類；資料不足時寧可降低可信度，不硬判。
-                        a["zeida_tags"] = list(full_eval.get("tags", []))
-                        a["primary_stage"] = full_eval.get("primary")
-                        a["strategy_scores"] = full_eval.get("scores", {})
-                        a["strategy_reasons"] = full_eval.get("reasons", {})
-                        a["strategy_confidence"] = full_eval.get("confidence", {})
-                        a["strategy_near"] = full_eval.get("near", [])
-                        a["course_conditions"] = full_eval.get("course", {})
-                        a["homework_labels"] = daily_homework_labels(a)
-                        a["data_quality"] = quality
-                        a["data_quality_breakdown"] = data_quality_breakdown(a, fund, sh, cp, cap)
-                        a["market_regime"] = market_regime
-                        a["final_confidence"] = final_conf
-                        a["short_ratio"] = full_eval.get("short_ratio", np.nan)
-                        a["pe_est"] = full_eval.get("pe_est", np.nan)
-                        a["capital"] = full_eval.get("capital", np.nan)
-                        a["market_cap"] = full_eval.get("market_cap", np.nan)
-                        a["small_cap"] = full_eval.get("small_cap")
-
-                        a["short_balance"] = sh.get("balance", np.nan)
-                        a["short_change5"] = sh.get("change5", np.nan)
-                        a["foreign5"] = cp.get("foreign5", 0.0)
-                        a["foreign10"] = cp.get("foreign10", 0.0)
-                        a["trust5"] = cp.get("trust5", 0.0)
-                        a["dealer5"] = cp.get("total5",0.0) - cp.get("foreign5",0.0) - cp.get("trust5",0.0)
-                        a["chip_positive_days5"] = cp.get("positive_days5",0)
-                        a["fundamental"] = fund
-                        a["capital_profile"] = cap
-                        a["squeeze_confirmed"] = bool(
-                            a.get("primary_stage")=="⑥強勢噴出"
-                            and finite(a.get("short_ratio"))
-                            and a["short_ratio"] >= .30
-                            and finite(a.get("short_change5"))
-                            and a["short_change5"] < 0
-                        )
-
-                        # 防呆：③不能是已經連續發動多日的股票。
-                        _a_data = a.get("data")
-                        if _a_data is not None and not _a_data.empty and "③剛起動" in a["zeida_tags"]:
-                            _recent_chg = _a_data["close"].pct_change().tail(5) * 100
-                            if int((_recent_chg >= 5).sum()) >= 2:
-                                a["zeida_tags"].remove("③剛起動")
-                                if "①強勢熱門" not in a["zeida_tags"] and "⑥強勢噴出" not in a["zeida_tags"]:
-                                    a["zeida_tags"].append("①強勢熱門")
-
-                        # 防呆：⑧整理轉強不允許當日已經大漲 ≥6%。
-                        # 新規則正常情況下本來就不會進⑧；這裡防止舊/異常資料污染。
-                        _today_chg = float(z.chg_pct) if finite(z.chg_pct) else np.nan
-                        if "⑧整理轉強" in a["zeida_tags"] and finite(_today_chg) and _today_chg >= 6:
-                            a["zeida_tags"].remove("⑧整理轉強")
-                            if "⑥強勢噴出" not in a["zeida_tags"]:
-                                a["zeida_tags"].append("⑥強勢噴出")
-
-                        # 防呆：⑦跌深轉折如果已經明顯高於20MA超過15%，不再視為「底部剛發動」。
-                        if "⑦跌深轉折" in a["zeida_tags"] and finite(a.get("bias20")) and a["bias20"] > 15:
-                            a["zeida_tags"].remove("⑦跌深轉折")
-
-                        # 主階段以完整規格評估結果為準；⑤是基本面副標籤，不搶主階段。
-                        if not a.get("primary_stage"):
-                            _prio = ["⑥強勢噴出","④強勢股拉回","③剛起動","⑦跌深轉折","①強勢熱門","⑧整理轉強","②盤整待突破"]
-                            a["primary_stage"] = next((x for x in _prio if x in a["zeida_tags"]), None)
-
-                        # 使用者畫面上的可調條件只影響「強勢排行」，不影響賊大分類是否被保留。
-                        a["ui_filter_pass"] = (
-                            (float(z.chg_pct) >= min_day if finite(z.chg_pct) else False)
-                            and ((not finite(a["r20"])) or a["r20"] >= min_month)
-                            and (season_rule=="不限" or bool(a["ma60_up"]))
-                            and (kd_rule=="不限" or bool(a["kd_golden"]))
-                        )
-
-                        details[z.stock_id] = a
-                        inst[z.stock_id] = cp.get("total", 0.0)
-                        fundamentals[z.stock_id] = fund
-                        shorts[z.stock_id] = sh
-                        chips[z.stock_id] = cp
-                except:
-                    pass
-                bar.progress((i+1)/max(len(target),1),text=f"深度分析 {i+1}/{len(target)}")
-                time.sleep(.04)
-            bar.empty()
-
-            # Prefer full analyses; keep fallback rows so Top 10 still appears.
-            scored=[]
-            for z in snap.itertuples(index=False):
-                a=details.get(z.stock_id)
-                if a:
-                    tech = min(60, round(a["score"]*0.60,1))
-                    chip_raw = inst.get(z.stock_id,0.0)
-                    chip = 20.0 if chip_raw>0 else 10.0 if chip_raw==0 else 4.0
-                    risk_bonus = max(0,20-a["risk"]*0.20)
-                    final = tech+chip+risk_bonus
-                else:
-                    final = (float(z.broad_score) if finite(z.broad_score) else 0.0)*0.72
-                scored.append(final)
-            snap["final_score"]=scored
-            snap=snap.sort_values(["final_score","activity"],ascending=False).reset_index(drop=True)
-
-            st.session_state["snap"]=snap
-            st.session_state["details"]=details
-            st.session_state["inst"]=inst
-            st.session_state["fundamentals"]=fundamentals
-            st.session_state["shorts"]=shorts
-            st.session_state["chips"]=chips
-
-if "snap" in st.session_state:
-    snap=st.session_state["snap"]
-    details=st.session_state.get("details",{})
-    inst=st.session_state.get("inst",{})
-    fundamentals=st.session_state.get("fundamentals",{})
-    shorts=st.session_state.get("shorts",{})
-    chips=st.session_state.get("chips",{})
-    _ranked_all = snap.copy()
-    _show_n = st.selectbox(
-        "強勢股顯示數量",
-        ["10 檔", "20 檔", "50 檔", "全部候選股"],
-        index=0,
-        key="top_show_n",
-        help="選『全部候選股』會顯示目前通過初篩的全部候選，不只 Top 10。"
-    )
-    if _show_n == "全部候選股":
-        top = _ranked_all.copy()
-    else:
-        top = _ranked_all.head(int(_show_n.split()[0])).copy()
-    for _c in ["close","chg_pct","activity","final_score"]:
-        if _c in top.columns:
-            top[_c] = pd.to_numeric(top[_c], errors="coerce")
-
-    market_all,_=snapshot()
-    total=len(market_all)
-    qualified=len(snap)
-    full=len(details)
-    strong=sum(1 for k,v in details.items() if finite(v.get("score")) and float(v.get("score"))>=80)
-
-    if _show_n == "全部候選股":
-        st.success(f"已切換為全部候選股：共 {len(top)} 檔。往下的『完整候選股清單』會全部列出。")
-
-    st.markdown('<div class="panel"><div class="panel-title">市場總覽</div>', unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="overview">
-      <div class="ov"><div class="t">上市＋上櫃 總檔數</div><div class="v">{total:,}</div><div class="s">全市場股票</div></div>
-      <div class="ov green"><div class="t">符合初篩檔數</div><div class="v">{qualified}</div><div class="s">{qualified/max(total,1)*100:.1f}%</div></div>
-      <div class="ov orange"><div class="t">進入賊大①～⑧檔數</div><div class="v">{full}</div><div class="s">{full/max(total,1)*100:.1f}%</div></div>
-      <div class="ov orange"><div class="t">強勢候選檔數</div><div class="v">{strong}</div><div class="s">深度分析80分以上</div></div>
-      <div class="ov red"><div class="t">🔥 Top 10 推薦</div><div class="v">{min(10,len(_ranked_all))}</div><div class="s">🏆 今日精選</div></div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ===== 賊大選股：直接把 8 大條件的股票全部選出來 =====
-    st.caption(f"選股邏輯版本：{APP_LOGIC_VERSION}")
-    st.markdown(
-        '<div class="panel"><div class="panel-title">🥷 賊大選股 '
-        '<span style="font-size:12px;color:#9fb1c2">（直接掃出條件一～八）</span></div>',
-        unsafe_allow_html=True
-    )
-
-    zeida_labels = [
-        "① 強勢熱門小型股",
-        "② 盤整待突破股",
-        "③ 剛起動的中小型股",
-        "④ 強勢股拉回股",
-        "⑤ 營運成長潛力股",
-        "⑥ 強勢噴出股（軋空中）",
-        "⑦ 跌深轉折出量股",
-        "⑧ 整理轉強股（軋空前）",
-    ]
-
-    # 對應 analyze() 內部標籤
-    tag_map = {
-        "① 強勢熱門小型股": "①強勢熱門",
-        "② 盤整待突破股": "②盤整待突破",
-        "③ 剛起動的中小型股": "③剛起動",
-        "④ 強勢股拉回股": "④強勢股拉回",
-        "⑤ 營運成長潛力股": "⑤營運成長潛力",
-        "⑥ 強勢噴出股（軋空中）": "⑥強勢噴出",
-        "⑦ 跌深轉折出量股": "⑦跌深轉折",
-        "⑧ 整理轉強股（軋空前）": "⑧整理轉強",
-    }
-
-    category_rows = {label: [] for label in zeida_labels}
-
-    _zeida_show_n = st.selectbox(
-        "每個賊大條件顯示數量",
-        ["5 檔", "10 檔", "20 檔", "全部符合"],
-        index=1,
-        key="zeida_show_n",
-        help="選『全部符合』會把該賊大條件目前符合的股票全部列出。"
-    )
-
-    # 直接依目前深度分析結果分桶，不再要求使用者自己選條件
-    for z in snap.itertuples(index=False):
-        a = details.get(z.stock_id)
-        if not a:
-            continue
-
-        tags = a.get("zeida_tags", [])
-        primary = a.get("primary_stage")
-        for label in zeida_labels:
-            target_tag = tag_map[label]
-            # ⑤是獨立基本面條件可額外顯示；其他①②③④⑥⑦⑧只放主階段，避免重複誤導。
-            if target_tag == "⑤營運成長潛力":
-                if target_tag not in tags:
-                    continue
-            else:
-                if primary != target_tag:
-                    continue
-
-            category_rows[label].append({
-                "代號": str(z.stock_id),
-                "名稱": str(z.stock_name),
-                "股價": float(z.close) if finite(z.close) else np.nan,
-                "漲跌幅%": float(z.chg_pct) if finite(z.chg_pct) else np.nan,
-                "成交金額(億)": float(z.activity)/1e8 if finite(z.activity) else np.nan,
-                "綜合分": float(z.final_score) if finite(z.final_score) else 0.0,
-                "風險": int(a["risk"]) if finite(a.get("risk")) else None,
-                "風報比": round(float(a["rr"]), 2) if finite(a.get("rr")) else None,
-                "型態": a.get("pattern", "-"),
-                "外資5日": round(float(a.get("foreign5",0.0)),0) if finite(a.get("foreign5",0.0)) else 0,
-                "融券5日變化": round(float(a.get("short_change5",np.nan)),0) if finite(a.get("short_change5",np.nan)) else np.nan,
-                "營收YoY%": round(float(a.get("fundamental",{}).get("revenue_yoy",np.nan)),1) if finite(a.get("fundamental",{}).get("revenue_yoy",np.nan)) else np.nan,
-                "EPS": round(float(a.get("fundamental",{}).get("eps",np.nan)),2) if finite(a.get("fundamental",{}).get("eps",np.nan)) else np.nan,
-                "戰術分數": int(a.get("strategy_scores",{}).get(target_tag,0) or 0),
-                "可信度": a.get("strategy_confidence",{}).get(target_tag,"低"),
-                "判斷理由": a.get("strategy_reasons",{}).get(target_tag,""),
-                "股本(億)": round(float(a.get("capital",np.nan))/1e8,1) if finite(a.get("capital")) else np.nan,
-                "法人5日": round(float(a.get("foreign5",0.0)+a.get("trust5",0.0)),0),
-                "融券5日變化": round(float(a.get("short_change5",np.nan)),0) if finite(a.get("short_change5")) else np.nan,
-                "最終可信度": int(a.get("final_confidence",{}).get("score",0) or 0),
-                "資料品質": int(a.get("data_quality",{}).get("score",0) or 0),
-                "大盤": a.get("market_regime",{}).get("label","中性"),
-                "原版條件": "✅" if a.get("course_conditions",{}).get(target_tag,{}).get("match") else ("—" if target_tag in ["⑥強勢噴出","⑦跌深轉折","⑧整理轉強"] else "❌"),
-                "每日功課": "、".join(a.get("homework_labels",[])[:3]),
+    try:
+        for r in http_json(TPEX_PROFILE):
+            sid = str(first_present(
+                r,
+                names=("SecuritiesCompanyCode",),
+                contains=("securitiescompanycode",)
+            ) or "").strip()
+            if not is_stock_code(sid):
+                continue
+            cap = safe_num(first_present(
+                r,
+                contains=("paidincapital", "capitalstock", "capital")
+            ))
+            par = safe_num(first_present(
+                r,
+                contains=("parvaluepershare", "parvalue")
+            ))
+            rows.append({
+                "stock_id": sid,
+                "market": "TPEx",
+                "profile_name": str(first_present(
+                    r, names=("CompanyAbbreviation",), contains=("companyabbreviation",)
+                ) or "").strip(),
+                "capital_ntd": cap,
+                "par_value": par,
             })
+    except Exception:
+        pass
 
+    p = pd.DataFrame(rows)
+    if p.empty:
+        return p
 
-    # 每個條件直接顯示最強前 5 檔
-    for label in zeida_labels:
-        rows = category_rows[label]
+    # 若官方欄位是「千元」而非元，使用保守偵測：
+    # 多數上市櫃公司實收資本額不會只有數百 / 數千元。
+    med = p["capital_ntd"].dropna().median()
+    if pd.notna(med) and med < 1_000_000:
+        p["capital_ntd"] = p["capital_ntd"] * 1000.0
+    return p
 
-        st.markdown(
-            f'<div style="margin-top:14px;font-size:18px;font-weight:700">{label}</div>',
-            unsafe_allow_html=True
-        )
+# ---------------------------
+# 月營收（條件⑤）
+# ---------------------------
 
-        if not rows:
-            st.caption("目前沒有符合條件的股票。")
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def fetch_latest_revenue():
+    out = []
+    for market, url in [("TWSE", TWSE_REVENUE), ("TPEx", TPEX_REVENUE)]:
+        try:
+            data = http_json(url)
+        except Exception:
             continue
+        for r in data:
+            sid = str(first_present(
+                r,
+                names=("公司代號", "SecuritiesCompanyCode"),
+                contains=("公司代號", "securitiescompanycode")
+            ) or "").strip()
+            if not is_stock_code(sid):
+                continue
 
-        df_cat = pd.DataFrame(rows)
-        df_cat = df_cat.sort_values(
-            ["綜合分", "風報比", "成交金額(億)"],
-            ascending=[False, False, False]
-        )
-        if _zeida_show_n != "全部符合":
-            df_cat = df_cat.head(int(_zeida_show_n.split()[0]))
+            rev_now = safe_num(first_present(
+                r,
+                contains=("當月營收", "currentmonthrevenue", "currentmonth")
+            ))
+            rev_last_year = safe_num(first_present(
+                r,
+                contains=("去年當月營收", "lastyearmonthrevenue", "previousyear")
+            ))
+            yoy = safe_num(first_present(
+                r,
+                contains=("去年同月增減", "年增率", "increaseorreduce", "yoy")
+            ))
+            if pd.isna(yoy) and pd.notna(rev_now) and pd.notna(rev_last_year) and rev_last_year != 0:
+                yoy = (rev_now / rev_last_year - 1) * 100
 
-        st.dataframe(
-            df_cat,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "股價": st.column_config.NumberColumn(format="%.2f"),
-                "漲跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
-                "成交金額(億)": st.column_config.NumberColumn(format="%.1f"),
-                "綜合分": st.column_config.NumberColumn(format="%.1f"),
-                "風報比": st.column_config.NumberColumn(format="%.2f"),
-                "外資5日": st.column_config.NumberColumn(format="%.0f"),
-                "融券5日變化": st.column_config.NumberColumn(format="%.0f"),
-                "營收YoY%": st.column_config.NumberColumn(format="%.1f"),
-                "EPS": st.column_config.NumberColumn(format="%.2f"),
-                "戰術分數": st.column_config.NumberColumn(format="%d"),
-                "股本(億)": st.column_config.NumberColumn(format="%.1f"),
-                "法人5日": st.column_config.NumberColumn(format="%.0f"),
-                "融券5日變化": st.column_config.NumberColumn(format="%.0f"),
-            },
-        )
-        st.caption(f"符合 {len(rows)} 檔，目前顯示 {len(df_cat)} 檔。")
+            year = safe_num(first_present(r, contains=("資料年度", "year")))
+            month = safe_num(first_present(r, contains=("資料月份", "month")))
 
-
-    # ② / ③ 接近成立候選
-    near_rows = []
-    for z in snap.itertuples(index=False):
-        a = details.get(z.stock_id)
-        if not a:
-            continue
-        for tag in a.get("near_tags", []):
-            near_rows.append({
-                "狀態": tag,
-                "代號": str(z.stock_id),
-                "名稱": str(z.stock_name),
-                "股價": float(z.close) if finite(z.close) else np.nan,
-                "漲跌幅%": float(z.chg_pct) if finite(z.chg_pct) else np.nan,
-                "成交金額(億)": float(z.activity)/1e8 if finite(z.activity) else np.nan,
-                "綜合分": float(z.final_score) if finite(z.final_score) else 0.0,
-                "風險": int(a["risk"]) if finite(a.get("risk")) else None,
-                "風報比": round(float(a["rr"]),2) if finite(a.get("rr")) else None,
+            out.append({
+                "stock_id": sid,
+                "market": market,
+                "revenue": rev_now,
+                "revenue_yoy": yoy,
+                "revenue_year": year,
+                "revenue_month": month,
             })
+    return pd.DataFrame(out)
 
-    if near_rows:
-        st.markdown(
-            '<div style="margin-top:18px;font-size:18px;font-weight:800;color:#ffbf52">🟡 ②／③ 接近成立候選</div>',
-            unsafe_allow_html=True
+# ---------------------------
+# FinMind 深度確認
+# ---------------------------
+
+def finmind_headers(token=""):
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+@st.cache_data(ttl=60*60*12, show_spinner=False)
+def finmind_institutional(stock_id, start_date, end_date, token=""):
+    try:
+        params = {
+            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+            "data_id": stock_id,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        r = requests.get(FINMIND_DATA, params=params, headers=finmind_headers(token), timeout=TIMEOUT)
+        j = r.json()
+        if j.get("status") != 200:
+            return pd.DataFrame()
+        df = pd.DataFrame(j.get("data", []))
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def finmind_eps(stock_id, start_date, token=""):
+    """抓綜合損益表，從 EPS 類型中取近三季。
+    若來源是累計 EPS，無法可靠拆季時回 NA，不硬猜。
+    """
+    try:
+        params = {
+            "dataset": "TaiwanStockFinancialStatements",
+            "data_id": stock_id,
+            "start_date": start_date,
+        }
+        r = requests.get(FINMIND_DATA, params=params, headers=finmind_headers(token), timeout=TIMEOUT)
+        j = r.json()
+        if j.get("status") != 200:
+            return np.nan, []
+        df = pd.DataFrame(j.get("data", []))
+        if df.empty:
+            return np.nan, []
+
+        mask = (
+            df["type"].astype(str).str.contains("EPS|EarningsPerShare|BasicEarningsPerShare", case=False, regex=True)
+            | df.get("origin_name", pd.Series("", index=df.index)).astype(str).str.contains("每股盈餘|基本每股", regex=True)
         )
-        near_df = pd.DataFrame(near_rows).sort_values(
-            ["狀態","綜合分","風報比"], ascending=[True,False,False]
-        )
-        st.dataframe(
-            near_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "股價": st.column_config.NumberColumn(format="%.2f"),
-                "漲跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
-                "成交金額(億)": st.column_config.NumberColumn(format="%.1f"),
-                "綜合分": st.column_config.NumberColumn(format="%.1f"),
-                "風報比": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
-        st.caption("黃色候選＝接近條件，但尚未正式成立；避免因規則太嚴完全漏股。")
+        e = df[mask].copy()
+        if e.empty:
+            return np.nan, []
+        e["date"] = pd.to_datetime(e["date"], errors="coerce")
+        e["value"] = pd.to_numeric(e["value"], errors="coerce")
+        e = e.dropna(subset=["date", "value"]).sort_values("date")
+        # 同一報表日期多個 EPS 欄位時，優先 origin_name 帶「基本每股」
+        e["priority"] = e.get("origin_name", "").astype(str).str.contains("基本每股").astype(int)
+        e = e.sort_values(["date", "priority"]).drop_duplicates("date", keep="last")
 
+        # 僅接受日期落在 3/31, 6/30, 9/30, 12/31 附近
+        # 若能取得近三個不同季報值，先回傳；畫面會標示「來源值」供人工核對。
+        last = e.tail(3)
+        if len(last) < 3:
+            return np.nan, []
+        vals = last["value"].tolist()
+        return float(np.nansum(vals)), [
+            {"date": d.strftime("%Y-%m-%d"), "eps": float(v)}
+            for d, v in zip(last["date"], last["value"])
+        ]
+    except Exception:
+        return np.nan, []
 
-    st.markdown(
-        '<div class="legend-grid" style="margin-top:14px">'
-        '<div class="legend"><h4>①～④ 技術主升路徑</h4><p>'
-        '①：股價走強＋量能活躍＋股本偏小＋法人流入。<br>'
-        '②：長期橫盤＋近期量能放大＋接近平台突破＋法人不轉空。<br>'
-        '③：核心型態＝前段漲幅不大＋突然放量＋第一波攻擊；法人/股本只加分。<br>'
-        '④：核心型態＝前40日已明顯上漲＋由高點拉回＋5MA洗盤且主趨勢未破；量縮/法人續買只加分。'
-        '</p></div>'
-        '<div class="legend"><h4>⑤～⑧ 資金/籌碼路徑</h4><p>'
-        '⑤：營收/EPS成長＋法人布局＋估值未明顯過熱。<br>'
-        '⑥：強勢創高＋爆量＋融券偏高＋回補跡象。<br>'
-        '⑦：長期跌深＋爆量＋站回均線＋仍在底部轉折區。<br>'
-        '⑧：站上中期均線＋整理未噴出＋融券增加＋量能逐步增加。'
-        '</p></div>'
-        '<div class="legend"><h4>成立規則</h4><p>'
-        '每一條都用 0～100 分；70分以上且可信度至少「中」才正式列入。'
-        '資料缺失時不猜，會降低可信度。⑤可以當基本面副標籤，其餘主階段只顯示一個。'
-        '</p></div>'
-        '<div class="legend"><h4>資金生命週期</h4><p>'
-        '⑤ → ② → ⑧ → ③ → ① → ④ → ⑥；⑦為跌深反轉另一條路徑。'
-        '分類目的先判斷主力所在階段，再決定操作策略，不是只看單一指標。'
-        '</p></div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def finmind_revenue_history(stock_id, token=""):
+    try:
+        params = {
+            "dataset": "TaiwanStockMonthRevenue",
+            "data_id": stock_id,
+            "start_date": "2002-01-01",
+        }
+        r = requests.get(FINMIND_DATA, params=params, headers=finmind_headers(token), timeout=TIMEOUT)
+        j = r.json()
+        if j.get("status") != 200:
+            return pd.DataFrame()
+        df = pd.DataFrame(j.get("data", []))
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-    st.markdown(
-        '<div style="margin-top:14px;font-size:13px;line-height:1.8;color:#9fb1c2">'
-        '資金生命週期：⑤ → ② → ⑧ → ③ → ① → ④ → ⑥；⑦為跌深反轉另一條路徑。'
-        '</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+# ---------------------------
+# 指標計算
+# ---------------------------
 
+def make_snapshot(history, profiles):
+    if history.empty:
+        return pd.DataFrame()
 
-
-
-
-    # ===== 原版條件 × 資金生命週期 =====
-    st.markdown('<div class="panel"><div class="panel-title">🧭 原版賊大條件 × 資金生命週期</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="legend-grid">'
-        '<div class="legend"><h4>課程原版數字條件</h4><p>'
-        '① 20日漲幅&gt;10%＋週轉&gt;10%＋股本&lt;20億。<br>'
-        '② 今日量&gt;5日均量20%＋30日漲跌幅絕對值&lt;1%＋法人動態。<br>'
-        '③ 10日漲幅&gt;1%＋今日量&gt;5日均量300%＋&gt;100張＋股本&lt;30億。<br>'
-        '④ 股價&lt;5MA＋40日漲幅&gt;30%＋10日三大法人賣超&gt;10000張。<br>'
-        '⑤ 股價&lt;50＋近三季EPS&gt;0.5＋月營收歷史新高＋YoY&gt;20%。'
-        '</p></div>'
-        '<div class="legend"><h4>資金生命週期確認</h4><p>'
-        '⑤ 起漲前夕 → ② 突破前整理 → ⑧ 整理吸籌 → ③ 起漲初期 → '
-        '① 主升初期 → ④ 主升回檔 → ⑥ 主升軋空。<br>'
-        '⑦ 為跌深反轉的另一條路徑。'
-        '</p></div>'
-        '<div class="legend"><h4>合併判斷方式</h4><p>'
-        '①～⑤先跑課程原版數字條件，再用價量、均線、法人、融券確認所處階段。'
-        '原版條件沒過，不硬塞正式分類；但會保留在接近候選。'
-        '⑥～⑧則以資金/籌碼與型態判讀為主。'
-        '</p></div>'
-        '<div class="legend"><h4>共通排除</h4><p>'
-        '股價≤5元排除；5日均量≤500張排除。'
-        '資料抓不到時不當成0，改降低資料品質與可信度。'
-        '</p></div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ===== 每日功課掃描 =====
-    st.markdown('<div class="panel"><div class="panel-title">📚 每日功課掃描</div>', unsafe_allow_html=True)
-    _hw_rows = []
-    for z in snap.itertuples(index=False):
-        a = details.get(z.stock_id)
-        if not a:
+    parts = []
+    for (sid, market), g in history.groupby(["stock_id", "market"], sort=False):
+        g = g.sort_values("date").drop_duplicates("date")
+        if len(g) < 6:
             continue
-        for lab in a.get("homework_labels", []):
-            _hw_rows.append({
-                "分類": lab,
-                "代號": str(z.stock_id),
-                "名稱": str(z.stock_name),
-                "股價": float(z.close) if finite(z.close) else np.nan,
-                "漲跌幅%": float(z.chg_pct) if finite(z.chg_pct) else np.nan,
-                "主階段": a.get("primary_stage") or "未正式成立",
-                "可信度": int(a.get("final_confidence",{}).get("score",0) or 0),
-            })
-    if _hw_rows:
-        _hw = pd.DataFrame(_hw_rows)
-        _order = ["1日強勢","3日強勢","5日強勢","1日弱勢","3日弱勢","5日弱勢","量大股","大幅震盪股","強勢股","弱勢股"]
-        _counts = _hw.groupby("分類").size().reindex(_order).dropna().astype(int)
-        st.caption("｜".join(f"{k} {v}檔" for k,v in _counts.items()))
-        _hw_pick = st.selectbox("查看每日功課分類", _order, key="homework_category")
-        _show = _hw[_hw["分類"] == _hw_pick].sort_values(["可信度","漲跌幅%"], ascending=False)
-        st.dataframe(_show, use_container_width=True, hide_index=True)
-    else:
-        st.info("目前沒有足夠資料產生每日功課分類。")
-    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ===== 資料品質儀表板 =====
-    st.markdown('<div class="panel"><div class="panel-title">🧩 資料品質儀表板</div>', unsafe_allow_html=True)
+        c = g["close"].to_numpy(dtype=float)
+        v = g["volume_shares"].to_numpy(dtype=float)
+        latest = g.iloc[-1]
+        # 課程「五日均量」這裡採「前5個完整交易日」，避免今天成交量同時進入分母。
+        prev5_v = v[-6:-1] if len(v) >= 6 else np.array([])
+        avg5_shares = np.nanmean(prev5_v) if len(prev5_v) == 5 else np.nan
 
-    _quality_rows = []
-    _name_map = {str(r.stock_id): str(r.stock_name) for r in snap.itertuples(index=False)}
-    for _sid, _a in details.items():
-        _q = _a.get("data_quality_breakdown", {})
-        if not _q:
-            continue
-        _quality_rows.append({
-            "代號": str(_sid),
-            "名稱": _name_map.get(str(_sid), str(_sid)),
-            "K線": _q.get("K線",{}).get("score",0),
-            "法人": _q.get("法人",{}).get("score",0),
-            "融券": _q.get("融券",{}).get("score",0),
-            "營收": _q.get("營收",{}).get("score",0),
-            "EPS": _q.get("EPS",{}).get("score",0),
-            "股本": _q.get("股本",{}).get("score",0),
-            "整體資料品質": _q.get("整體",{}).get("score",0),
+        close_5ma = np.nanmean(c[-5:]) if len(c) >= 5 else np.nan
+        r10 = pct(c[-1], c[-11]) if len(c) >= 11 else np.nan
+        r20 = pct(c[-1], c[-21]) if len(c) >= 21 else np.nan
+        r30 = pct(c[-1], c[-31]) if len(c) >= 31 else np.nan
+        r40 = pct(c[-1], c[-41]) if len(c) >= 41 else np.nan
+
+        parts.append({
+            "stock_id": sid,
+            "market": market,
+            "name": latest["name"],
+            "date": latest["date"],
+            "close": latest["close"],
+            "volume_shares": latest["volume_shares"],
+            "volume_lots": latest["volume_shares"] / 1000.0,
+            "avg5_volume_shares": avg5_shares,
+            "avg5_volume_lots": avg5_shares / 1000.0 if pd.notna(avg5_shares) else np.nan,
+            "volume_vs_5avg_pct": (latest["volume_shares"] / avg5_shares * 100.0) if pd.notna(avg5_shares) and avg5_shares > 0 else np.nan,
+            "ma5": close_5ma,
+            "r10": r10,
+            "r20": r20,
+            "r30": r30,
+            "r40": r40,
         })
 
-    if _quality_rows:
-        _qdf = pd.DataFrame(_quality_rows)
-        _avgq = {col: float(_qdf[col].mean()) for col in ["K線","法人","融券","營收","EPS","股本","整體資料品質"]}
+    snap = pd.DataFrame(parts)
+    if snap.empty:
+        return snap
 
-        st.markdown(
-            f'<div class="summary-grid" style="grid-template-columns:repeat(4,1fr)">'
-            f'<div class="summary-card blue"><div class="label">K線品質</div><div class="big">{_avgq["K線"]:.0f}</div><div class="small">歷史價格 / 成交量</div></div>'
-            f'<div class="summary-card green"><div class="label">法人品質</div><div class="big">{_avgq["法人"]:.0f}</div><div class="small">外資 / 投信 / 自營</div></div>'
-            f'<div class="summary-card orange"><div class="label">融券品質</div><div class="big">{_avgq["融券"]:.0f}</div><div class="small">餘額 / 5日變化</div></div>'
-            f'<div class="summary-card red"><div class="label">整體資料品質</div><div class="big">{_avgq["整體資料品質"]:.0f}</div><div class="small">85以上較理想</div></div>'
-            f'</div>',
-            unsafe_allow_html=True
+    if not profiles.empty:
+        snap = snap.merge(profiles, on=["stock_id", "market"], how="left")
+        snap["name"] = np.where(
+            snap["name"].astype(str).str.len() > 0,
+            snap["name"],
+            snap["profile_name"].fillna("")
         )
-
-        st.dataframe(
-            _qdf.sort_values("整體資料品質", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-            height=min(800, 80 + len(_qdf)*35)
-        )
-        st.caption("未取得資料不會當成0買超或0融券，而是直接降低資料品質分數。")
     else:
-        st.info("目前還沒有足夠深度分析資料可計算資料品質。")
+        snap["capital_ntd"] = np.nan
+        snap["par_value"] = np.nan
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    # 股本億元
+    snap["capital_100m"] = snap["capital_ntd"] / 100_000_000.0
+    # 流通股數：實收資本額 / 普通股每股面額
+    snap["shares_outstanding"] = np.where(
+        snap["capital_ntd"].notna() & snap["par_value"].notna() & (snap["par_value"] > 0),
+        snap["capital_ntd"] / snap["par_value"],
+        np.nan
+    )
+    snap["turnover_pct"] = np.where(
+        snap["shares_outstanding"].notna() & (snap["shares_outstanding"] > 0),
+        snap["volume_shares"] / snap["shares_outstanding"] * 100.0,
+        np.nan
+    )
+    return snap
 
-    # ===== 高可信度精選 =====
-    _hc_rows = []
-    for z in snap.itertuples(index=False):
-        a = details.get(z.stock_id)
-        if not a:
-            continue
-        fc = a.get("final_confidence",{})
+# ---------------------------
+# 條件
+# ---------------------------
+
+def apply_conditions(snap, cond2_abs30=True):
+    d = snap.copy()
+
+    common_filter = (d["close"] > 5) & (d["avg5_volume_lots"] > 500)
+
+    # 條件①
+    d["c1_r20"] = d["r20"] > 10
+    d["c1_turn"] = d["turnover_pct"] > 10
+    d["c1_cap"] = d["capital_100m"] < 20
+    d["cond1"] = common_filter & d["c1_r20"] & d["c1_turn"] & d["c1_cap"]
+
+    # 條件②
+    # 圖片原文「近一日成交量大於五日均量的20%」採字面：今日量 > 五日均量 × 20%
+    d["c2_vol"] = d["volume_vs_5avg_pct"] > 20
+    if cond2_abs30:
+        d["c2_r30"] = d["r30"].abs() < 1
+    else:
+        d["c2_r30"] = d["r30"] < 1
+    d["cond2"] = common_filter & d["c2_vol"] & d["c2_r30"]
+
+    # 條件③
+    # 圖片原文是「不要過濾股價5元以下、五日均量500張以下」
+    d["c3_r10"] = d["r10"] > 1
+    d["c3_vol"] = d["volume_vs_5avg_pct"] > 300
+    d["c3_todayvol"] = d["volume_lots"] > 100
+    d["c3_cap"] = d["capital_100m"] < 30
+    d["cond3"] = d["c3_r10"] & d["c3_vol"] & d["c3_todayvol"] & d["c3_cap"]
+
+    # 條件④
+    d["c4_below5ma"] = d["close"] < d["ma5"]
+    d["c4_r40"] = d["r40"] > 30
+    d["cond4_pre"] = common_filter & d["c4_below5ma"] & d["c4_r40"]
+    d["inst10_net_lots"] = np.nan
+    d["c4_inst"] = np.nan
+    d["cond4"] = False
+
+    # 條件⑤ preliminary
+    # 圖片原文同樣是「不要過濾股價5元以下、五日均量500張以下」
+    d["c5_price"] = d["close"] < 50
+    d["eps3_sum"] = np.nan
+    d["c5_eps"] = np.nan
+    d["revenue_yoy"] = np.nan
+    d["revenue_high"] = np.nan
+    d["c5_rev_growth"] = np.nan
+    d["cond5"] = False
+
+    return d
+
+def verify_condition4(d, finmind_token=""):
+    idxs = d.index[d["cond4_pre"]].tolist()
+    if not idxs:
+        return d
+    end = d["date"].max().date()
+    start = end - timedelta(days=20)
+
+    progress = st.progress(0, text="條件④：確認近10交易日三大法人...")
+    for n, i in enumerate(idxs):
+        sid = d.at[i, "stock_id"]
+        df = finmind_institutional(
+            sid, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), finmind_token
+        )
+        net_lots = np.nan
+        if not df.empty and {"date", "buy", "sell"}.issubset(df.columns):
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df["buy"] = pd.to_numeric(df["buy"], errors="coerce")
+            df["sell"] = pd.to_numeric(df["sell"], errors="coerce")
+            # 每日各法人加總後，取最近10個有資料交易日
+            daily = df.groupby("date")[["buy", "sell"]].sum().sort_index().tail(10)
+            if len(daily) >= 1:
+                # FinMind buy/sell 單位為股，換算張
+                net_lots = ((daily["buy"] - daily["sell"]).sum()) / 1000.0
+        d.at[i, "inst10_net_lots"] = net_lots
+        if pd.notna(net_lots):
+            # 原文：近10天三大法人「賣超大於10000張」=> 淨買賣 < -10000 張
+            d.at[i, "c4_inst"] = bool(net_lots < -10000)
+            d.at[i, "cond4"] = bool(d.at[i, "cond4_pre"] and d.at[i, "c4_inst"])
+        progress.progress((n + 1) / len(idxs), text=f"條件④ 法人確認 {n+1}/{len(idxs)}")
+    progress.empty()
+    return d
+
+def verify_condition5(d, finmind_token=""):
+    rev = fetch_latest_revenue()
+    if not rev.empty:
+        d = d.merge(
+            rev[["stock_id", "market", "revenue", "revenue_yoy"]],
+            on=["stock_id", "market"], how="left", suffixes=("", "_official")
+        )
+        if "revenue_yoy_official" in d.columns:
+            d["revenue_yoy"] = d["revenue_yoy_official"].combine_first(d["revenue_yoy"])
+        elif "revenue_yoy_y" in d.columns:
+            d["revenue_yoy"] = d["revenue_yoy_y"].combine_first(d["revenue_yoy"])
+
+    # 先用「股價<50 + 營收成長>20」縮小候選，再查完整歷史營收與 EPS
+    prelim = d["c5_price"] & (d["revenue_yoy"] > 20)
+    idxs = d.index[prelim.fillna(False)].tolist()
+    if not idxs:
+        return d
+
+    progress = st.progress(0, text="條件⑤：確認歷史新高與近三季EPS...")
+    eps_start = (date.today() - timedelta(days=520)).strftime("%Y-%m-%d")
+
+    for n, i in enumerate(idxs):
+        sid = d.at[i, "stock_id"]
+
+        rh = finmind_revenue_history(sid, finmind_token)
+        is_high = np.nan
+        if not rh.empty and "revenue" in rh.columns:
+            rh["revenue"] = pd.to_numeric(rh["revenue"], errors="coerce")
+            rh = rh.dropna(subset=["revenue"])
+            if len(rh):
+                latest = rh.iloc[-1]["revenue"]
+                prev_max = rh.iloc[:-1]["revenue"].max() if len(rh) > 1 else -np.inf
+                is_high = bool(latest > prev_max)
+        d.at[i, "revenue_high"] = is_high
+
+        eps3, details = finmind_eps(sid, eps_start, finmind_token)
+        d.at[i, "eps3_sum"] = eps3
+        if pd.notna(eps3):
+            d.at[i, "c5_eps"] = bool(eps3 > 0.5)
+
+        if pd.notna(d.at[i, "revenue_yoy"]):
+            d.at[i, "c5_rev_growth"] = bool(d.at[i, "revenue_yoy"] > 20)
+
         if (
-            a.get("primary_stage")
-            and fc.get("score",0) >= 82
-            and a.get("data_quality",{}).get("score",0) >= 75
+            pd.notna(d.at[i, "c5_eps"])
+            and pd.notna(d.at[i, "revenue_high"])
+            and pd.notna(d.at[i, "c5_rev_growth"])
         ):
-            _hc_rows.append({
-                "代號":str(z.stock_id),
-                "名稱":str(z.stock_name),
-                "主階段":a.get("primary_stage"),
-                "可信度":int(fc.get("score",0)),
-                "戰術分":int(a.get("strategy_scores",{}).get(a.get("primary_stage"),0)),
-                "資料品質":int(a.get("data_quality",{}).get("score",0)),
-                "大盤":a.get("market_regime",{}).get("label","中性"),
-                "風險":int(a.get("risk",0)) if finite(a.get("risk")) else None,
-                "風報比":round(float(a.get("rr")),2) if finite(a.get("rr")) else np.nan,
-                "理由":a.get("strategy_reasons",{}).get(a.get("primary_stage"),""),
-            })
-
-    st.markdown('<div class="panel"><div class="panel-title">🎯 高可信度精選</div>', unsafe_allow_html=True)
-    if _hc_rows:
-        _hc = pd.DataFrame(_hc_rows).sort_values(["可信度","戰術分","風報比"],ascending=False).head(10)
-        st.dataframe(_hc,use_container_width=True,hide_index=True)
-        st.caption("只列最終可信度 ≥82 且資料品質 ≥75 的股票；沒有達標就寧可少選。")
-    else:
-        st.info("目前沒有最終可信度 ≥82 的股票。寧可不硬選。")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ===== 策略回測 =====
-    st.markdown(
-        '<div class="panel"><div class="panel-title">🧪 賊大戰術回測 '
-        '<span style="font-size:12px;color:#9fb1c2">（目前深度分析股票的近一年歷史訊號）</span></div>',
-        unsafe_allow_html=True
-    )
-    bt = backtest_summary(details)
-    if bt.empty:
-        st.info("目前回測樣本不足。")
-    else:
-        # 樣本太少時不要讓勝率看起來過度精確
-        bt_show = bt.copy()
-        bt_show["可信度"] = bt_show["樣本數"].apply(
-            lambda n: "高" if n >= 50 else "中" if n >= 20 else "低"
-        )
-        st.dataframe(
-            bt_show,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "隔日勝率%": st.column_config.NumberColumn(format="%.1f%%"),
-                "5日勝率%": st.column_config.NumberColumn(format="%.1f%%"),
-                "10日勝率%": st.column_config.NumberColumn(format="%.1f%%"),
-                "平均5日%": st.column_config.NumberColumn(format="%+.2f%%"),
-                "平均10日%": st.column_config.NumberColumn(format="%+.2f%%"),
-                "10日最大不利%": st.column_config.NumberColumn(format="%+.2f%%"),
-            }
-        )
-        valid_bt = bt[bt["樣本數"] >= 10].copy()
-        if not valid_bt.empty:
-            best5 = valid_bt.sort_values(["5日勝率%","平均5日%"], ascending=False).iloc[0]
-            best10 = valid_bt.sort_values(["10日勝率%","平均10日%"], ascending=False).iloc[0]
-            st.markdown(
-                f'<div class="overview" style="margin-top:8px">'
-                f'<div class="ov green"><div class="t">5日勝率最佳</div><div class="v">{best5["策略"]}</div><div class="s">{best5["5日勝率%"]:.1f}%｜樣本 {int(best5["樣本數"])}</div></div>'
-                f'<div class="ov orange"><div class="t">10日勝率最佳</div><div class="v">{best10["策略"]}</div><div class="s">{best10["10日勝率%"]:.1f}%｜樣本 {int(best10["樣本數"])}</div></div>'
-                f'</div>',
-                unsafe_allow_html=True
+            d.at[i, "cond5"] = bool(
+                d.at[i, "c5_price"]
+                and d.at[i, "c5_eps"]
+                and d.at[i, "revenue_high"]
+                and d.at[i, "c5_rev_growth"]
             )
-        st.caption("回測不是未來保證；⑤基本面策略需要完整歷史財報時間對齊，目前只做即時選股，不納入歷史勝率。")
-    st.markdown("</div>", unsafe_allow_html=True)
 
+        progress.progress((n + 1) / len(idxs), text=f"條件⑤ 深度確認 {n+1}/{len(idxs)}")
+    progress.empty()
+    return d
 
-    if _show_n == "全部候選股":
-        st.markdown('<div class="panel"><div class="panel-title">📋 完整候選股清單</div>', unsafe_allow_html=True)
-        _all_view = top[["stock_id","stock_name","close","chg_pct","activity","final_score"]].copy()
-        _all_view.columns = ["代號","名稱","股價","漲跌幅%","成交金額","綜合分"]
-        _all_view["成交金額(億)"] = pd.to_numeric(_all_view["成交金額"], errors="coerce") / 1e8
-        _all_view = _all_view.drop(columns=["成交金額"])
-        st.dataframe(
-            _all_view,
-            use_container_width=True,
-            hide_index=True,
-            height=min(1200, 80 + len(_all_view)*35),
-            column_config={
-                "股價": st.column_config.NumberColumn(format="%.2f"),
-                "漲跌幅%": st.column_config.NumberColumn(format="%+.2f%%"),
-                "成交金額(億)": st.column_config.NumberColumn(format="%.1f"),
-                "綜合分": st.column_config.NumberColumn(format="%.1f"),
-            }
-        )
-        st.caption(f"完整候選股共 {len(_all_view)} 檔，這張表不會只截前 10 / 20 / 50 檔。")
-        st.markdown("</div>", unsafe_allow_html=True)
+# ---------------------------
+# UI
+# ---------------------------
 
-    st.markdown(
-        f'<div class="panel"><div class="panel-title">🏆 強勢股排名 '
-        f'<span style="font-size:12px;color:#9fb1c2">（依綜合評分排序｜目前顯示 {len(top)} 檔）</span></div>',
-        unsafe_allow_html=True
-    )
+st.title("📈 賊大選股")
+st.caption("核心選股版 v1｜先把資料與條件做準，面板美化放下一步")
 
-    trs=[]
-    for rank,z in enumerate(top.itertuples(index=False),1):
-        a=details.get(z.stock_id)
-        inst5=float(inst.get(z.stock_id,0.0)) if finite(inst.get(z.stock_id,0.0)) else 0.0
-        z_chg = float(z.chg_pct) if finite(z.chg_pct) else 0.0
-        z_final = float(z.final_score) if finite(z.final_score) else 0.0
-        z_close = float(z.close) if finite(z.close) else np.nan
-        z_activity = float(z.activity) if finite(z.activity) else np.nan
-        if a:
-            dlast=a["data"].iloc[-1]
-            flags=[
-                finite(dlast.get("ma5")) and finite(dlast.get("ma10")) and finite(dlast.get("ma20")) and float(dlast["ma5"])>float(dlast["ma10"])>float(dlast["ma20"]),
-                bool(a["ma60_up"]),
-                finite(a.get("vr")) and float(a.get("vr"))>=1.3,
-                bool(a["kd_golden"]),
-                finite(a.get("rsi")) and float(a.get("rsi"))>50,
-                bool(a["macd_positive"]),
-                inst5>0,
-                finite(a.get("risk")) and float(a.get("risk"))<=40,
-            ]
-            flagtxt=" ".join("🟢" if x else "🔴" for x in flags)
-            _score=float(a.get("score")) if finite(a.get("score")) else 0.0
-            tech=min(60,round(_score*.60,1))
-            chip=20.0 if inst5>0 else 10.0 if inst5==0 else 4.0
-            bias=a["bias60"]
-            s1,s2=a["support"],a["support2"]
-            r1,r2=a["resistance"],a["resistance2"]
-            risk=a["risk"]; rr=a["rr"]
-            grade=grade_for(_score)
-            vr=float(a.get("vr")) if finite(a.get("vr")) else np.nan
-        else:
-            flagtxt="⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪ ⚪"
-            tech=round(z_final*.60,1); chip=0.0
-            bias=s1=s2=r1=r2=risk=rr=np.nan; grade="觀察"; vr=np.nan
-
-        cls="up" if z_chg >= 0 else "down"
-        trs.append(
-            f'<tr>'
-            f'<td class="rank">{rank}</td><td class="code">{z.stock_id}</td><td>{z.stock_name}</td>'
-            f'<td class="price">{price2(z_close)}</td><td class="{cls}">{signed_pct(z_chg)}</td>'
-            f'<td>{money_yi(z_activity)}</td><td class="volr">{f2(vr)}</td>'
-            f'<td>{flagtxt}</td><td>{tech:.1f}</td><td>{chip:.1f}</td>'
-            f'<td class="volr">{f2(bias)}%</td>'
-            f'<td>{f1(s1)}</td><td>{f1(s2)}</td><td>{f1(r1)}</td><td>{f1(r2)}</td>'
-            f'<td class="{risk_class(risk)}">{"-" if not finite(risk) else int(risk)}</td>'
-            f'<td class="rr">{f2(rr)}</td><td class="grade">{grade}</td>'
-            f'</tr>'
-        )
-
-    # HTML 前面不能保留 4 個以上空白，否則 Markdown 會把它當成程式碼區塊顯示原始 <td>。
-    table_html = (
-        '<div class="table-wrap"><table class="stock-table"><thead><tr>'
-        '<th>排名</th><th>代號</th><th>名稱</th><th>股價</th><th>漲跌幅</th><th>成交金額(億)</th><th>量比</th>'
-        '<th>8項技術/籌碼檢核</th><th>技術分(60%)</th><th>籌碼分(20%)</th><th>乖離率(離季線)</th>'
-        '<th>支撐1</th><th>支撐2</th><th>壓力1</th><th>壓力2</th><th>風險係數</th><th>風報比</th><th>評等</th>'
-        '</tr></thead><tbody>'
-        + ''.join(trs) +
-        '</tbody></table></div>'
-    )
-    st.markdown(table_html, unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
+with st.expander("📘 本版嚴格依照你提供的課程圖片", expanded=False):
     st.markdown("""
-    <div class="legend-grid">
-      <div class="legend"><h4>8項技術／籌碼檢核燈號</h4>
-        <p>① 均線多頭排列（短＞中＞長）</p><p>② 股價站上季線</p><p>③ 成交量放大（大於20日均量）</p><p>④ KD 黃金交叉</p>
-        <p>⑤ RSI ＞ 50</p><p>⑥ MACD 柱狀體 ＞ 0</p><p>⑦ 法人近5日買超</p><p>⑧ 風險係數 ≤ 40</p>
-      </div>
-      <div class="legend"><h4>乖離率（離季線）說明</h4>
-        <p><span class="red">+5%以上：</span>強勢過熱</p><p><span class="orange">+2%～+5%：</span>偏強</p>
-        <p><span class="green">-2%～+2%：</span>合理區間</p><p><span class="orange">-2%～-5%：</span>偏弱</p><p><span class="red">-5%以下：</span>超跌</p>
-      </div>
-      <div class="legend"><h4>風險係數說明（0～100）</h4>
-        <p><span class="green">● 0～30</span>　風險低（安全區）</p><p><span class="orange">● 31～60</span>　風險中（注意區）</p>
-        <p><span class="red">● 61～100</span>　風險高（警戒區）</p><p>評估：乖離、爆量、20MA、斜率、RSI、風報比。</p>
-      </div>
-      <div class="legend"><h4>風報比說明</h4>
-        <p>風報比＝預估上漲空間 ÷ 預估下跌風險</p><p>數值越高，報酬相對風險越好。</p>
-        <p><span class="green">S 90～100</span> 極強</p><p><span class="orange">A+ 80～89</span> 很強</p><p>A 70～79｜A- 60～69｜B 50～59｜C &lt;50</p>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+**條件①**
+- 近20交易日股價漲跌幅 > 10%
+- 近一日週轉率 > 10%
+- 股本 < 20億元
+- 過濾：股價5元以下、5日均量500張以下
 
-    st.markdown('<div class="panel"><div class="panel-title">個股詳細分析</div>', unsafe_allow_html=True)
-    options=[f"{z.stock_id} {z.stock_name}" for z in top.itertuples(index=False)]
-    selected=st.selectbox("選擇股票",options,index=0)
-    code=selected.split()[0]
-    row=top[top["stock_id"]==code].iloc[0]
+**條件②**
+- 近一日成交量 > 五日均量的20%（本版先照圖片字面值）
+- 近30交易日股價漲跌幅 < 1%
+- 過濾：股價5元以下、5日均量500張以下
+- 再搭配外資、投信動態判斷
 
-    if code not in details:
-        try:
-            with st.spinner("補抓這檔完整歷史資料…"):
-                h=hist(code,row["market"])
-                a=analyze(h) if not h.empty else None
-                if a is not None:
-                    details[code]=a
-                    inst[code]=institutional_5d(code)
-                    st.session_state["details"]=details
-                    st.session_state["inst"]=inst
-            st.session_state["fundamentals"]=fundamentals
-            st.session_state["shorts"]=shorts
-            st.session_state["chips"]=chips
-        except:
-            pass
+**條件③**
+- 近10交易日股價漲跌幅 > 1%
+- 近一日成交量 > 五日均量300%
+- 近一日成交量 > 100張
+- 股本 < 30億元
+- 圖片寫「不要過濾」股價5元以下、5日均量500張以下
 
-    if code in details:
-        a=details[code]
-        left,right=st.columns([1.55,1])
-        with left:
-            st.plotly_chart(chart(a["data"],code,row["stock_name"]),use_container_width=True)
-        with right:
-            st.markdown(f"""
-            <div class="detail-box"><h4>技術指標</h4>
-              <p>型態：{a["pattern"]}</p><p>KD：{"黃金交叉" if a["kd_golden"] else "整理"}</p>
-              <p>RSI(14)：{a["rsi"]:.1f}</p><p>量比：{a["vr"]:.2f}x</p>
-              <p>MA5：{slope_label(a["s5"])}</p><p>MA20：{slope_label(a["s20"])}</p><p>MA60：{slope_label(a["s60"])}</p>
-            </div>
-            <div class="detail-box"><h4>支撐 / 壓力</h4>
-              <p>支撐1：{f2(a["support"])}</p><p>支撐2：{f2(a["support2"])}</p><p>壓力1：{f2(a["resistance"])}</p><p>壓力2：{f2(a["resistance2"])}</p>
-            </div>
-            <div class="detail-box"><h4>乖離 / 風險</h4>
-              <p>離季線：{f2(a["bias60"])}%</p><p>風險係數：{a["risk"]}/100</p><p>風報比：{f2(a["rr"])}</p>
-              <p>法人5日淨額：{inst.get(code,0):,.0f}</p>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.info("這檔目前無法取得完整歷史 K 線，但 Top 10 排行仍可正常使用。")
-    st.markdown("</div>", unsafe_allow_html=True)
+**條件④**
+- 近一交易日股價 < 5日MA
+- 近40交易日股價漲跌幅 > 30%
+- 近10天三大法人賣超 > 10,000張
+- 過濾：股價5元以下、5日均量500張以下
 
-st.markdown('<div class="note">＊本系統僅提供盤後研究參考，投資請自行評估風險，盈虧自負。</div>', unsafe_allow_html=True)
+**條件⑤**
+- 股價 < 50元
+- 近三季EPS合計 > 0.5元
+- 近一個月營收創歷史新高
+- 近一個月營收成長率 > 20%
+- 圖片寫「不要過濾」股價5元以下、5日均量500張以下
+""")
 
+with st.sidebar:
+    st.header("掃描設定")
+    cond2_mode = st.radio(
+        "條件②「30日漲跌幅 <1%」",
+        ["用絕對值 |漲跌幅| < 1%（盤整）", "照字面：漲跌幅 < 1%"],
+        index=0
+    )
+    finmind_token = st.text_input(
+        "FinMind Token（可空白）",
+        type="password",
+        help="空白也能用免費額度；填免費帳號 Token 可提高每小時額度。"
+    )
+    do_deep = st.checkbox("掃描後自動做④⑤深度確認", value=True)
+    st.info("第一次掃描要抓近約 78 天的官方日行情，會比之後慢；Streamlit 會快取。")
 
-st.markdown(r'''
-<style>
-/* ===== Reference-matched dashboard skin ===== */
-:root{
-  --bg:#06101a;
-  --panel:#0a1622;
-  --panel2:#0c1b29;
-  --border:#1b3953;
-  --border-hi:#235b87;
-  --text:#eef5fb;
-  --muted:#9cb0c2;
-  --blue:#35a7ff;
-  --green:#4bd37b;
-  --orange:#ffad2f;
-  --red:#ff5a5f;
-  --yellow:#ffc94d;
-}
+if st.button("🚀 掃描上市＋上櫃全部股票", type="primary", use_container_width=True):
+    with st.spinner("抓取 TWSE／TPEx 官方日行情與公司主檔..."):
+        hist = fetch_history()
+        profiles = fetch_profiles()
 
-.stApp{
-  background:#06101a!important;
-  color:var(--text)!important;
-}
-.block-container{
-  max-width:1420px!important;
-  padding:14px 14px 28px!important;
-}
+    if hist.empty:
+        st.error("目前沒有抓到行情資料。請稍後重試；程式不會把缺資料當成 0。")
+        st.stop()
 
-/* header */
-.hero{
-  min-height:72px;
-  padding:10px 8px 12px!important;
-  border:none!important;
-  border-radius:0!important;
-  background:transparent!important;
-  box-shadow:none!important;
-  margin-bottom:4px!important;
-}
-.hero-left{gap:10px!important}
-.hero-icon{font-size:34px!important}
-.hero-title{font-size:28px!important;font-weight:900!important;line-height:1!important}
-.hero-sub{font-size:13px!important;color:#b8c6d5!important;margin-top:7px!important}
-.hero-meta{font-size:12px!important;color:#aebdcc!important}
-.hero-title .pro{color:#ffad2f!important}
+    snap = make_snapshot(hist, profiles)
+    if snap.empty:
+        st.error("行情有下載，但無法形成足夠交易日的個股序列。")
+        st.stop()
 
-/* top nav: flatter and more like the reference */
-.navbar{
-  margin:2px 0 10px!important;
-  border:1px solid #1a3550!important;
-  border-radius:7px!important;
-  background:#091522!important;
-}
-.navitem{
-  padding:10px 8px!important;
-  font-size:13px!important;
-  background:#0a1724!important;
-  border-right:1px solid #18314a!important;
-}
-.navitem.active{
-  color:#57b7ff!important;
-  background:#0c2740!important;
-  box-shadow:inset 0 0 0 1px #2c8bd0!important;
-}
+    d = apply_conditions(
+        snap,
+        cond2_abs30=(cond2_mode.startswith("用絕對值"))
+    )
 
-/* section shells */
-.section,.panel,.filterbox{
-  background:#091521!important;
-  border:1px solid #1b3852!important;
-  border-radius:8px!important;
-  box-shadow:none!important;
-}
-.section{padding:10px!important;margin:9px 0!important}
-.panel{padding:0!important;margin:9px 0!important;overflow:hidden}
-.filterbox{padding:10px 10px 4px!important;margin:9px 0!important}
-.section-title,.panel-title{
-  font-size:16px!important;
-  font-weight:800!important;
-  color:#48adff!important;
-}
-.panel-title{
-  margin:0!important;
-  padding:9px 12px!important;
-  border-bottom:1px solid #1b3852!important;
-  background:#0a1724!important;
-}
+    if do_deep:
+        d = verify_condition4(d, finmind_token)
+        d = verify_condition5(d, finmind_token)
 
-/* summary row exactly 5 columns on desktop */
-.summary-grid{
-  grid-template-columns:repeat(5,1fr)!important;
-  gap:8px!important;
-}
-.summary-card{
-  min-height:114px!important;
-  padding:12px 10px!important;
-  text-align:center!important;
-  align-items:center!important;
-  border-radius:6px!important;
-  background:#0b1825!important;
-  border:1px solid #21425e!important;
-}
-.summary-card .label{font-size:13px!important;color:#d4dee7!important}
-.summary-card .big{font-size:30px!important;line-height:1.05!important}
-.summary-card .small{font-size:11px!important;color:#a4b5c6!important}
-.summary-card.red{border-color:#bd4046!important}
-.summary-card.green .big{color:#54db82!important}
-.summary-card.orange .big{color:#ffad2f!important}
-.summary-card.purple .big{color:#ffb22f!important}
-.summary-card.red .big{color:#ff6166!important}
-.summary-card.blue .big{color:#ffffff!important}
+    st.session_state["scan"] = d
+    st.session_state["hist"] = hist
 
-/* filter inputs */
-[data-testid="stSelectbox"] label{font-size:11px!important;color:#b8c6d4!important}
-div[data-baseweb="select"]>div{
-  min-height:38px!important;
-  background:#081522!important;
-  border:1px solid #294760!important;
-  border-radius:5px!important;
-  color:#edf5fb!important;
-}
-.stButton>button{
-  min-height:38px!important;
-  border-radius:5px!important;
-  background:#157fe0!important;
-  border:1px solid #2d9cff!important;
-  font-size:13px!important;
-  font-weight:800!important;
-}
+d = st.session_state.get("scan")
+if d is not None and not d.empty:
+    last_date = d["date"].max().strftime("%Y-%m-%d")
+    st.success(f"掃描完成｜資料最新交易日：{last_date}｜共 {len(d):,} 檔可計算")
 
-/* top10 table: compact and high-density */
-.table-wrap{
-  border:none!important;
-  border-radius:0!important;
-  background:#08131e!important;
-}
-.stock-table{
-  min-width:1320px!important;
-  font-size:11px!important;
-}
-.stock-table th{
-  background:#0c1a27!important;
-  padding:7px 5px!important;
-  border-color:#28445b!important;
-  font-weight:800!important;
-}
-.stock-table td{
-  padding:7px 5px!important;
-  background:#091521!important;
-  border-color:#18344a!important;
-}
-.stock-table tr:nth-child(even) td{background:#0a1824!important}
-.stock-table tr:hover td{background:#102336!important}
-.stock-table .price{color:#ffd05c!important}
-.stock-table .up{color:#ff696f!important}
-.stock-table .down{color:#56d388!important}
-.stock-table .volr{color:#ffb33b!important}
-.stock-table .grade{color:#dcecff!important}
+    counts = [int(d[f"cond{i}"].fillna(False).sum()) for i in range(1,6)]
+    cols = st.columns(5)
+    for i, c in enumerate(counts, 1):
+        cols[i-1].metric(f"條件{i}", f"{c} 檔")
 
-/* legends in 4 equal cards */
-.legend-grid{
-  grid-template-columns:repeat(4,1fr)!important;
-  gap:8px!important;
-  margin-top:8px!important;
-}
-.legend{
-  min-height:250px!important;
-  padding:11px!important;
-  border-radius:6px!important;
-  background:#0a1724!important;
-  border:1px solid #1e3a52!important;
-}
-.legend h4{font-size:15px!important;color:#4eb1ff!important}
-.legend p,.legend li{font-size:11px!important;line-height:1.75!important}
+    tabs = st.tabs(["條件①", "條件②", "條件③", "條件④", "條件⑤", "全部透明檢查"])
 
-/* dataframe/other native widgets */
-[data-testid="stDataFrame"],[data-testid="stDataFrameResizable"]{
-  background:#091521!important;
-  border:1px solid #1e3e58!important;
-  border-radius:6px!important;
-}
-[data-testid="stAlert"]{
-  background:#0a1b29!important;
-  border-color:#24516f!important;
-}
+    def base_cols():
+        return ["stock_id","name","market","close","volume_lots","avg5_volume_lots","capital_100m"]
 
-/* mobile */
-@media(max-width:900px){
-  .block-container{padding:8px 7px 20px!important}
-  .hero-title{font-size:23px!important}
-  .hero-sub{font-size:11px!important}
-  .hero-meta{display:none!important}
-  .navbar{grid-template-columns:repeat(5,118px)!important;overflow-x:auto!important}
-  .summary-grid{grid-template-columns:repeat(2,1fr)!important}
-  .summary-card{min-height:104px!important}
-  .legend-grid{grid-template-columns:1fr!important}
-}
-</style>
-''', unsafe_allow_html=True)
+    with tabs[0]:
+        x = d[d["cond1"].fillna(False)].copy()
+        show = x[base_cols()+["r20","turnover_pct"]].sort_values("r20", ascending=False)
+        show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","20日漲幅%","週轉率%"]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        x = d[d["cond2"].fillna(False)].copy()
+        show = x[base_cols()+["volume_vs_5avg_pct","r30"]].sort_values("volume_vs_5avg_pct", ascending=False)
+        show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","量/5日均量%","30日漲幅%"]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("課程寫『再搭配外資跟投信的動態來判斷』；此欄目前先保留為二次人工判讀，不把它偷改成硬門檻。")
+
+    with tabs[2]:
+        x = d[d["cond3"].fillna(False)].copy()
+        show = x[base_cols()+["r10","volume_vs_5avg_pct"]].sort_values("volume_vs_5avg_pct", ascending=False)
+        show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","10日漲幅%","量/5日均量%"]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with tabs[3]:
+        x = d[d["cond4"].fillna(False)].copy()
+        show = x[base_cols()+["ma5","r40","inst10_net_lots"]].sort_values("r40", ascending=False)
+        show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","5MA","40日漲幅%","10日三大法人淨買賣(張)"]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        if d["cond4_pre"].sum() and d["inst10_net_lots"].isna().all():
+            st.warning("④目前只完成價格初篩，法人資料尚未取得；不會把 NA 當 0。")
+
+    with tabs[4]:
+        x = d[d["cond5"].fillna(False)].copy()
+        show = x[base_cols()+["eps3_sum","revenue_yoy","revenue_high"]].sort_values("revenue_yoy", ascending=False)
+        show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","近三季EPS合計","營收成長率%","營收歷史新高"]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.warning("⑤的 EPS 會把來源值攤開供核對；若免費來源無法確認為『單季EPS』，應視為 NA，不硬算。")
+
+    with tabs[5]:
+        cols = [
+            "stock_id","name","market","close",
+            "r10","r20","r30","r40",
+            "volume_lots","avg5_volume_lots","volume_vs_5avg_pct",
+            "capital_100m","turnover_pct","ma5",
+            "cond1","cond2","cond3","cond4","cond5",
+        ]
+        z = d[cols].copy().sort_values(["cond1","cond2","cond3","cond4","cond5"], ascending=False)
+        z.columns = [
+            "代號","名稱","市場","收盤",
+            "10日%","20日%","30日%","40日%",
+            "今日量(張)","5日均量(張)","量/5均%",
+            "股本(億)","週轉率%","5MA",
+            "①","②","③","④","⑤"
+        ]
+        st.dataframe(z, use_container_width=True, hide_index=True)
+
+    st.divider()
+    sid = st.selectbox(
+        "查看單一股票逐條驗證",
+        options=d["stock_id"].astype(str).tolist(),
+        format_func=lambda s: f"{s} {d.loc[d['stock_id'].astype(str).eq(s), 'name'].iloc[0]}"
+    )
+    r = d[d["stock_id"].astype(str).eq(sid)].iloc[0]
+
+    st.subheader(f"{sid} {r['name']}｜透明條件檢查")
+    st.markdown(f"""
+**條件①**  
+{yn(r['r20'] > 10 if pd.notna(r['r20']) else np.nan)} 20日漲跌幅：{fmt(r['r20'],2,'%')}　（>10%）  
+{yn(r['turnover_pct'] > 10 if pd.notna(r['turnover_pct']) else np.nan)} 近一日週轉率：{fmt(r['turnover_pct'],2,'%')}　（>10%）  
+{yn(r['capital_100m'] < 20 if pd.notna(r['capital_100m']) else np.nan)} 股本：{fmt(r['capital_100m'],2,'億')}　（<20億）  
+
+**條件②**  
+{yn(r['volume_vs_5avg_pct'] > 20 if pd.notna(r['volume_vs_5avg_pct']) else np.nan)} 今日量 / 5日均量：{fmt(r['volume_vs_5avg_pct'],1,'%')}　（>20%）  
+{yn(abs(r['r30']) < 1 if pd.notna(r['r30']) and cond2_mode.startswith('用絕對值') else (r['r30'] < 1 if pd.notna(r['r30']) else np.nan))} 30日漲跌幅：{fmt(r['r30'],2,'%')}  
+
+**條件③**  
+{yn(r['r10'] > 1 if pd.notna(r['r10']) else np.nan)} 10日漲跌幅：{fmt(r['r10'],2,'%')}　（>1%）  
+{yn(r['volume_vs_5avg_pct'] > 300 if pd.notna(r['volume_vs_5avg_pct']) else np.nan)} 今日量 / 5日均量：{fmt(r['volume_vs_5avg_pct'],1,'%')}　（>300%）  
+{yn(r['volume_lots'] > 100 if pd.notna(r['volume_lots']) else np.nan)} 今日成交量：{fmt(r['volume_lots'],0,'張')}　（>100張）  
+{yn(r['capital_100m'] < 30 if pd.notna(r['capital_100m']) else np.nan)} 股本：{fmt(r['capital_100m'],2,'億')}　（<30億）  
+
+**條件④**  
+{yn(r['close'] < r['ma5'] if pd.notna(r['ma5']) else np.nan)} 收盤 / 5MA：{fmt(r['close'])} / {fmt(r['ma5'])}  
+{yn(r['r40'] > 30 if pd.notna(r['r40']) else np.nan)} 40日漲跌幅：{fmt(r['r40'],2,'%')}　（>30%）  
+{yn(r['inst10_net_lots'] < -10000 if pd.notna(r['inst10_net_lots']) else np.nan)} 近10日三大法人淨買賣：{fmt(r['inst10_net_lots'],0,'張')}　（賣超>10,000張）  
+
+**條件⑤**  
+{yn(r['close'] < 50)} 股價：{fmt(r['close'])}　（<50元）  
+{yn(r['eps3_sum'] > 0.5 if pd.notna(r['eps3_sum']) else np.nan)} 近三季EPS合計：{fmt(r['eps3_sum'])}　（>0.5）  
+{yn(r['revenue_high'] if pd.notna(r['revenue_high']) else np.nan)} 近一月營收創歷史新高：{r['revenue_high'] if pd.notna(r['revenue_high']) else 'NA'}  
+{yn(r['revenue_yoy'] > 20 if pd.notna(r['revenue_yoy']) else np.nan)} 近一月營收成長率：{fmt(r['revenue_yoy'],2,'%')}　（>20%）  
+
+**共通過濾（僅①②④）**  
+股價：{fmt(r['close'])}｜5日均量：{fmt(r['avg5_volume_lots'],0,'張')}
+""")
+
+st.caption("資料來源：TWSE / TPEx 官方公開資料；FinMind 免費 API 僅用於初篩後的法人、EPS、歷史營收深度確認。投資決策請自行判斷。")
