@@ -557,18 +557,18 @@ def apply_conditions(snap, cond2_abs30=True):
     d["c4_r40"] = d["r40"] > 30
     d["cond4_pre"] = common_filter & d["c4_below5ma"] & d["c4_r40"]
     d["inst10_net_lots"] = np.nan
-    d["c4_inst"] = np.nan
-    d["cond4"] = False
+    d["c4_inst"] = pd.Series([None] * len(d), index=d.index, dtype="object")
+    d["cond4"] = pd.Series([False] * len(d), index=d.index, dtype="object")
 
     # 條件⑤ preliminary
     # 圖片原文同樣是「不要過濾股價5元以下、五日均量500張以下」
     d["c5_price"] = d["close"] < 50
     d["eps3_sum"] = np.nan
-    d["c5_eps"] = np.nan
+    d["c5_eps"] = pd.Series([None] * len(d), index=d.index, dtype="object")
     d["revenue_yoy"] = np.nan
-    d["revenue_high"] = np.nan
-    d["c5_rev_growth"] = np.nan
-    d["cond5"] = False
+    d["revenue_high"] = pd.Series([None] * len(d), index=d.index, dtype="object")
+    d["c5_rev_growth"] = pd.Series([None] * len(d), index=d.index, dtype="object")
+    d["cond5"] = pd.Series([False] * len(d), index=d.index, dtype="object")
 
     return d
 
@@ -668,7 +668,7 @@ def verify_condition5(d, finmind_token=""):
 # ---------------------------
 
 st.title("📈 賊大選股")
-st.caption("核心選股版 v1｜先把資料與條件做準，面板美化放下一步")
+st.caption("核心選股版 v1.2｜已修正 Streamlit Cloud 型別相容問題")
 
 with st.expander("📘 本版嚴格依照你提供的課程圖片", expanded=False):
     st.markdown("""
