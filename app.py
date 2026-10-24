@@ -933,6 +933,12 @@ def make_snapshot(history, profiles):
             "avg5_volume_lots": avg5_shares / 1000.0 if pd.notna(avg5_shares) else np.nan,
             "volume_vs_5avg_pct": (latest["volume_shares"] / avg5_shares * 100.0) if pd.notna(avg5_shares) and avg5_shares > 0 else np.nan,
             "ma5": close_5ma,
+            "ma10": float(g["close"].tail(10).mean()) if len(g) >= 10 else np.nan,
+            "ma20": float(g["close"].tail(20).mean()) if len(g) >= 20 else np.nan,
+            "range20_pct": (
+                (float(g["high"].tail(20).max()) / float(g["low"].tail(20).min()) - 1) * 100.0
+                if len(g) >= 20 and float(g["low"].tail(20).min()) > 0 else np.nan
+            ),
             "r10": r10,
             "r20": r20,
             "r30": r30,
@@ -1112,6 +1118,223 @@ def verify_condition5(d, finmind_token=""):
     progress.empty()
     return d
 
+
+
+# ---------------------------
+# 三套實戰策略 + A/B/C 分級
+# ---------------------------
+
+def _near_pct(price, ref):
+    if pd.isna(price) or pd.isna(ref) or ref == 0:
+        return np.nan
+    return abs(price / ref - 1) * 100.0
+
+def prepare_live_strategy_features(d):
+    x = d.copy()
+    x["ma_spread_pct"] = np.nan
+    for i, r in x.iterrows():
+        vals = [r.get(c) for c in ["ma5", "ma10", "ma20"] if pd.notna(r.get(c))]
+        if len(vals) >= 2 and min(vals) > 0:
+            x.at[i, "ma_spread_pct"] = (max(vals) / min(vals) - 1) * 100.0
+
+    x["dist_ma5_pct"] = x.apply(lambda r: _near_pct(r.get("close"), r.get("ma5")), axis=1)
+    x["dist_ma10_pct"] = x.apply(lambda r: _near_pct(r.get("close"), r.get("ma10")), axis=1)
+
+    x["inst_day1_lots"] = np.nan
+    x["inst_day2_lots"] = np.nan
+    x["inst_2d_total_lots"] = np.nan
+    x["inst_2d_both_buy"] = pd.Series([None] * len(x), index=x.index, dtype="object")
+    return x
+
+def verify_two_day_institutional(d, finmind_token="", max_candidates=30):
+    x = d.copy()
+    prelim = (
+        x["range20_pct"].notna()
+        & (x["range20_pct"] <= 14)
+        & x["ma_spread_pct"].notna()
+        & (x["ma_spread_pct"] <= 4.0)
+        & x["r20"].notna()
+        & (x["r20"].abs() <= 8)
+    )
+    candidates = x.loc[prelim].copy()
+    if candidates.empty:
+        return x
+
+    candidates["_liq"] = candidates["avg5_volume_lots"].fillna(0)
+    idxs = candidates.sort_values("_liq", ascending=False).head(max_candidates).index.tolist()
+    end = x["date"].max().date()
+    start = end - timedelta(days=12)
+
+    progress = st.progress(0, text="盤整策略：確認法人最近2個交易日...")
+    for n, i in enumerate(idxs):
+        sid = str(x.at[i, "stock_id"])
+        df = finmind_institutional(
+            sid,
+            start.strftime("%Y-%m-%d"),
+            end.strftime("%Y-%m-%d"),
+            finmind_token,
+        )
+        if not df.empty and {"date", "buy", "sell"}.issubset(df.columns):
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df["buy"] = pd.to_numeric(df["buy"], errors="coerce")
+            df["sell"] = pd.to_numeric(df["sell"], errors="coerce")
+            daily = df.groupby("date")[["buy", "sell"]].sum().sort_index()
+            daily["net_lots"] = (daily["buy"] - daily["sell"]) / 1000.0
+            daily = daily.dropna(subset=["net_lots"]).tail(2)
+            vals = daily["net_lots"].tolist()
+
+            if len(vals) >= 1:
+                x.at[i, "inst_day2_lots"] = vals[-1]
+            if len(vals) >= 2:
+                x.at[i, "inst_day1_lots"] = vals[-2]
+                x.at[i, "inst_2d_total_lots"] = vals[-2] + vals[-1]
+                x.at[i, "inst_2d_both_buy"] = bool(vals[-2] > 0 and vals[-1] > 0)
+
+        progress.progress((n + 1) / len(idxs), text=f"法人2日確認 {n+1}/{len(idxs)}")
+    progress.empty()
+    return x
+
+def classify_consolidation_inst(row):
+    rng = row.get("range20_pct")
+    spread = row.get("ma_spread_pct")
+    r20 = row.get("r20")
+    inst_both = row.get("inst_2d_both_buy")
+    avg5 = row.get("avg5_volume_lots")
+
+    if any(pd.isna(v) for v in [rng, spread, r20]):
+        return None, "", ""
+
+    base = (rng <= 14) and (spread <= 4.0) and (abs(r20) <= 8)
+    if not base:
+        return None, "", ""
+
+    liquid_ok = pd.notna(avg5) and avg5 >= 300
+
+    if inst_both is True and rng <= 9 and spread <= 2.5 and abs(r20) <= 5 and liquid_ok:
+        return "A", "盤整緊密、均線糾結、法人連買2日", "若跌破箱型下緣則失效"
+    if inst_both is True:
+        return "B", "盤整成立、法人連買2日", "盤整仍偏寬或均線尚未完全收斂"
+    if inst_both is None:
+        return "C", "盤整成立，但法人2日資料未確認", "法人資料不足，先列觀察"
+    return "C", "盤整成立，但法人尚未連買2日", "法人動能不足"
+
+def classify_strong_pullback(row):
+    close = row.get("close")
+    ma5 = row.get("ma5")
+    ma10 = row.get("ma10")
+    ma20 = row.get("ma20")
+    r20 = row.get("r20")
+    vratio = row.get("volume_vs_5avg_pct")
+
+    if any(pd.isna(v) for v in [close, ma5, ma10, ma20, r20]):
+        return None, "", ""
+
+    if r20 < 10:
+        return None, "", ""
+
+    d5 = abs(close / ma5 - 1) * 100
+    d10 = abs(close / ma10 - 1) * 100
+    trend_up = ma5 >= ma10 >= ma20
+    no_heavy_sell = pd.isna(vratio) or vratio <= 180
+
+    if d5 <= 2.0 and trend_up and close >= ma10 and no_heavy_sell:
+        return "A", "強勢股回踩5日線，多頭排列仍在", "若爆量跌破10日線則降級"
+    if d10 <= 2.5 and ma10 >= ma20 and close >= ma20 and no_heavy_sell:
+        return "B", "強勢股回踩10日線，主趨勢仍向上", "回檔較深，需等止跌確認"
+    if close < ma10 or not trend_up:
+        return "C", "前段強勢但回檔轉弱", "跌破10日線或均線轉弱"
+    return None, "", ""
+
+def classify_big_volume(row):
+    vr = row.get("volume_vs_5avg_pct")
+    close = row.get("close")
+    ma5 = row.get("ma5")
+    r10 = row.get("r10")
+
+    if pd.isna(vr):
+        return None, "", ""
+
+    if vr >= 300:
+        grade = "A"
+    elif vr >= 200:
+        grade = "B"
+    elif vr >= 150:
+        grade = "C"
+    else:
+        return None, "", ""
+
+    why = f"成交量達5日均量 {vr:.0f}%"
+    risks = []
+    if pd.notna(close) and pd.notna(ma5) and close < ma5:
+        risks.append("股價在5日線下")
+    if pd.notna(r10) and r10 > 15:
+        risks.append("10日漲幅偏大")
+    risk = "、".join(risks) if risks else "需再看是否突破壓力與K棒型態"
+    return grade, why, risk
+
+def apply_live_strategies(d):
+    x = d.copy()
+    for prefix in ["s_consol", "s_pullback", "s_bigvol"]:
+        x[f"{prefix}_grade"] = ""
+        x[f"{prefix}_reason"] = ""
+        x[f"{prefix}_risk"] = ""
+
+    for i, r in x.iterrows():
+        for prefix, func in [
+            ("s_consol", classify_consolidation_inst),
+            ("s_pullback", classify_strong_pullback),
+            ("s_bigvol", classify_big_volume),
+        ]:
+            g, reason, risk = func(r)
+            if g:
+                x.at[i, f"{prefix}_grade"] = g
+                x.at[i, f"{prefix}_reason"] = reason
+                x.at[i, f"{prefix}_risk"] = risk
+    return x
+
+def strategy_success_score(row, strategy):
+    grade = row.get(f"{strategy}_grade", "")
+    base = {"A": 78.0, "B": 66.0, "C": 54.0}.get(grade, np.nan)
+    if pd.isna(base):
+        return np.nan
+    score = base
+
+    if strategy == "s_consol":
+        total = row.get("inst_2d_total_lots")
+        if pd.notna(total):
+            score += 4 if total > 1000 else (2 if total > 0 else 0)
+        rng = row.get("range20_pct")
+        if pd.notna(rng) and rng <= 7:
+            score += 3
+
+    elif strategy == "s_pullback":
+        d5 = row.get("dist_ma5_pct")
+        d10 = row.get("dist_ma10_pct")
+        if pd.notna(d5) and d5 <= 1:
+            score += 3
+        if pd.notna(d10) and d10 <= 1:
+            score += 2
+        vr = row.get("volume_vs_5avg_pct")
+        if pd.notna(vr) and vr < 100:
+            score += 2
+
+    elif strategy == "s_bigvol":
+        vr = row.get("volume_vs_5avg_pct")
+        if pd.notna(vr) and 300 <= vr <= 600:
+            score += 3
+        elif pd.notna(vr) and vr > 900:
+            score -= 5
+        r10 = row.get("r10")
+        if pd.notna(r10) and r10 > 20:
+            score -= 4
+
+    return round(max(35.0, min(88.0, score)), 1)
+
+def add_live_scores(d):
+    x = d.copy()
+    for s in ["s_consol", "s_pullback", "s_bigvol"]:
+        x[f"{s}_success"] = x.apply(lambda r, ss=s: strategy_success_score(r, ss), axis=1)
+    return x
 
 # ---------------------------
 # 勝率與入選原因
@@ -1433,7 +1656,28 @@ def enrich_trade_info(d, history):
 
 st.title("📈 賊大選股")
 st.caption("💻 平板建議橫向使用；表格可左右滑動，頁籤也可橫向滑動。")
-st.caption("核心選股版 v1.7｜資料紅綠燈＋雙來源抽樣驗證")
+st.caption("核心選股版 v2.0｜穩定資料＋三套實戰策略＋ABC分級")
+
+
+with st.expander("🎯 新版三套實戰策略", expanded=True):
+    st.markdown("""
+**① 盤整＋法人近2天買超**
+- A級：盤整更緊、均線更糾結、法人連買2天
+- B級：盤整成立、法人連買2天
+- C級：盤整成立，但法人尚未確認或尚未連2買
+
+**② 強勢股回踩5日／10日線**
+- A級：前段強勢、回踩5日線、多頭排列仍在
+- B級：回踩10日線、主趨勢仍向上
+- C級：前段強勢但跌破10日線或均線轉弱
+
+**③ 爆大量股**
+- A級：今日量 ≥ 5日均量300%
+- B級：今日量 ≥ 200%
+- C級：今日量 ≥ 150%
+
+A/B/C 與預估成功率是規則式評分，不是保證獲利。
+""")
 
 with st.expander("📘 本版嚴格依照你提供的課程圖片", expanded=False):
     st.markdown("""
@@ -1488,8 +1732,10 @@ with st.sidebar:
         help="官方 TWSE/TPEx 是主來源；Fugle 不做全市場主掃描，只在缺漏或單檔驗證時使用。"
     )
     st.caption("資料優先順序：TWSE/TPEx 官方 → Fugle 單檔備援 → FinMind 法人/EPS/營收補充")
-    do_deep = st.checkbox("掃描後自動做④⑤深度確認", value=True)
-    st.info("第一次掃描要抓近約 78 天的官方日行情，會比之後慢；Streamlit 會快取。")
+    do_deep = st.checkbox("掃描後自動做④⑤深度確認", value=False)
+    verify_inst2 = st.checkbox("盤整策略：確認法人最近2天買超", value=True)
+    max_inst_candidates = st.slider("法人2日最多確認幾檔", 10, 60, 30, 5)
+    st.info("穩定版先做資料紅綠燈。紅燈直接停止選股；法人查詢限制候選數，避免免費API不穩。")
 
 if st.button("🚀 掃描上市＋上櫃全部股票", type="primary", use_container_width=True):
     with st.spinner("抓取 TWSE／TPEx 官方日行情與公司主檔..."):
@@ -1521,6 +1767,16 @@ if st.button("🚀 掃描上市＋上櫃全部股票", type="primary", use_conta
         snap,
         cond2_abs30=(cond2_mode.startswith("用絕對值"))
     )
+
+    d = prepare_live_strategy_features(d)
+    if verify_inst2:
+        d = verify_two_day_institutional(
+            d,
+            finmind_token=finmind_token,
+            max_candidates=max_inst_candidates
+        )
+    d = apply_live_strategies(d)
+    d = add_live_scores(d)
 
     if do_deep:
         d = verify_condition4(d, finmind_token)
@@ -1583,36 +1839,116 @@ if d is not None and not d.empty:
         st.stop()
 
 
-    counts = [int(d[f"cond{i}"].fillna(False).sum()) for i in range(1,6)]
-    cols = st.columns(5)
-    for i, c in enumerate(counts, 1):
-        cols[i-1].metric(f"條件{i}", f"{c} 檔")
+    a1 = int((d["s_consol_grade"] == "A").sum())
+    a2 = int((d["s_pullback_grade"] == "A").sum())
+    a3 = int((d["s_bigvol_grade"] == "A").sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("盤整＋法人｜A級", f"{a1} 檔")
+    c2.metric("強勢回踩｜A級", f"{a2} 檔")
+    c3.metric("爆大量｜A級", f"{a3} 檔")
 
-    tabs = st.tabs(["條件①", "條件②", "條件③", "條件④", "條件⑤", "策略勝率", "全部股票檢查表"])
+    tabs = st.tabs([
+        "🎯 盤整＋法人2天",
+        "📉 強勢回踩5/10日",
+        "💥 爆大量股",
+        "條件①","條件②","條件③","條件④","條件⑤",
+        "策略勝率","全部股票檢查表"
+    ])
 
     def base_cols():
         return ["stock_id","name","market","close","volume_lots","avg5_volume_lots","capital_100m"]
 
+    def live_base_cols():
+        return [
+            "stock_id","name","market","close",
+            "volume_lots","avg5_volume_lots",
+            "ma5","ma10","ma20",
+            "建議進場下緣","建議進場上緣",
+            "第一支撐","第一壓力"
+        ]
+
     with tabs[0]:
+        x = d[d["s_consol_grade"] != ""].copy()
+        if x.empty:
+            st.info("目前沒有符合盤整策略的股票。")
+        else:
+            x["_rank"] = x["s_consol_grade"].map({"A":3,"B":2,"C":1}).fillna(0)
+            show = x[live_base_cols()+[
+                "range20_pct","ma_spread_pct",
+                "inst_day1_lots","inst_day2_lots","inst_2d_total_lots",
+                "s_consol_grade","s_consol_success","s_consol_reason","s_consol_risk"
+            ]].copy()
+            show["_rank"] = x["_rank"].values
+            show = show.sort_values(["_rank","s_consol_success"], ascending=[False,False]).drop(columns=["_rank"])
+            show.columns = [
+                "代號","名稱","市場","收盤","今日量(張)","5日均量(張)",
+                "5MA","10MA","20MA","進場下緣","進場上緣","第一支撐","第一壓力",
+                "20日區間%","均線糾結%","法人前1日(張)","法人最新日(張)","法人2日合計(張)",
+                "等級","預估成功率%","原因","風險"
+            ]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.caption("法人欄位＝三大法人合計；拿不到資料時保持 NA，不補 0。")
+
+    with tabs[4]:
+        x = d[d["s_pullback_grade"] != ""].copy()
+        if x.empty:
+            st.info("目前沒有符合強勢回踩策略的股票。")
+        else:
+            x["_rank"] = x["s_pullback_grade"].map({"A":3,"B":2,"C":1}).fillna(0)
+            show = x[live_base_cols()+[
+                "r20","dist_ma5_pct","dist_ma10_pct","volume_vs_5avg_pct",
+                "s_pullback_grade","s_pullback_success","s_pullback_reason","s_pullback_risk"
+            ]].copy()
+            show["_rank"] = x["_rank"].values
+            show = show.sort_values(["_rank","s_pullback_success"], ascending=[False,False]).drop(columns=["_rank"])
+            show.columns = [
+                "代號","名稱","市場","收盤","今日量(張)","5日均量(張)",
+                "5MA","10MA","20MA","進場下緣","進場上緣","第一支撐","第一壓力",
+                "20日漲幅%","距5MA%","距10MA%","量/5均%",
+                "等級","預估成功率%","原因","風險"
+            ]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with tabs[5]:
+        x = d[d["s_bigvol_grade"] != ""].copy()
+        if x.empty:
+            st.info("目前沒有符合爆大量策略的股票。")
+        else:
+            x["_rank"] = x["s_bigvol_grade"].map({"A":3,"B":2,"C":1}).fillna(0)
+            show = x[live_base_cols()+[
+                "volume_vs_5avg_pct","r10","r20",
+                "s_bigvol_grade","s_bigvol_success","s_bigvol_reason","s_bigvol_risk"
+            ]].copy()
+            show["_rank"] = x["_rank"].values
+            show = show.sort_values(["_rank","volume_vs_5avg_pct"], ascending=[False,False]).drop(columns=["_rank"])
+            show.columns = [
+                "代號","名稱","市場","收盤","今日量(張)","5日均量(張)",
+                "5MA","10MA","20MA","進場下緣","進場上緣","第一支撐","第一壓力",
+                "量/5均%","10日漲幅%","20日漲幅%",
+                "等級","預估成功率%","原因","風險"
+            ]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with tabs[6]:
         x = d[d["cond1"].fillna(False)].copy()
         show = x[base_cols()+["r20","turnover_pct","預估成功率","建議進場下緣","建議進場上緣","第一支撐","第一壓力","成功原因","風險原因","reason1"]].sort_values("r20", ascending=False)
         show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","20日漲幅%","週轉率%","預估成功率%","進場下緣","進場上緣","第一支撐","第一壓力","成功原因","風險原因","入選原因"]
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-    with tabs[1]:
+    with tabs[4]:
         x = d[d["cond2"].fillna(False)].copy()
         show = x[base_cols()+["volume_vs_5avg_pct","r30","預估成功率","建議進場下緣","建議進場上緣","第一支撐","第一壓力","成功原因","風險原因","reason2"]].sort_values("volume_vs_5avg_pct", ascending=False)
         show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","量/5日均量%","30日漲幅%","預估成功率%","進場下緣","進場上緣","第一支撐","第一壓力","成功原因","風險原因","入選原因"]
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.caption("課程寫『再搭配外資跟投信的動態來判斷』；此欄目前先保留為二次人工判讀，不把它偷改成硬門檻。")
 
-    with tabs[2]:
+    with tabs[5]:
         x = d[d["cond3"].fillna(False)].copy()
         show = x[base_cols()+["r10","volume_vs_5avg_pct","預估成功率","建議進場下緣","建議進場上緣","第一支撐","第一壓力","成功原因","風險原因","reason3"]].sort_values("volume_vs_5avg_pct", ascending=False)
         show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","10日漲幅%","量/5日均量%","預估成功率%","進場下緣","進場上緣","第一支撐","第一壓力","成功原因","風險原因","入選原因"]
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-    with tabs[3]:
+    with tabs[6]:
         x = d[d["cond4"].fillna(False)].copy()
         show = x[base_cols()+["ma5","r40","inst10_net_lots","預估成功率","建議進場下緣","建議進場上緣","第一支撐","第一壓力","成功原因","風險原因","reason4"]].sort_values("r40", ascending=False)
         show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","5MA","40日漲幅%","10日三大法人淨買賣(張)","預估成功率%","進場下緣","進場上緣","第一支撐","第一壓力","成功原因","風險原因","入選原因"]
@@ -1620,14 +1956,14 @@ if d is not None and not d.empty:
         if d["cond4_pre"].sum() and d["inst10_net_lots"].isna().all():
             st.warning("④目前只完成價格初篩，法人資料尚未取得；不會把 NA 當 0。")
 
-    with tabs[4]:
+    with tabs[7]:
         x = d[d["cond5"].fillna(False)].copy()
         show = x[base_cols()+["eps3_sum","revenue_yoy","revenue_high","預估成功率","建議進場下緣","建議進場上緣","第一支撐","第一壓力","成功原因","風險原因","reason5"]].sort_values("revenue_yoy", ascending=False)
         show.columns = ["代號","名稱","市場","收盤","今日量(張)","5日均量(張)","股本(億)","近三季EPS合計","營收成長率%","營收歷史新高","預估成功率%","進場下緣","進場上緣","第一支撐","第一壓力","成功原因","風險原因","入選原因"]
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.warning("⑤的 EPS 會把來源值攤開供核對；若免費來源無法確認為『單季EPS』，應視為 NA，不硬算。")
 
-    with tabs[5]:
+    with tabs[8]:
         st.subheader("📊 策略歷史勝率")
         st.caption("勝率＝訊號出現後，在指定交易日後收盤價高於訊號日收盤價的比例。")
         bt = st.session_state.get("bt_summary", pd.DataFrame())
@@ -1642,7 +1978,7 @@ if d is not None and not d.empty:
         )
         st.caption("①的歷史週轉率與①/③股本門檻暫採現行公司主檔；若期間曾增減資，結果可能有偏差。")
 
-    with tabs[6]:
+    with tabs[9]:
         cols = [
             "stock_id","name","market","close",
             "r10","r20","r30","r40",
